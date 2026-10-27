@@ -19,3 +19,10 @@
 ## 协议
 
 交互契约（消息、时序、不变量）见 [protocol.md](protocol.md)。要点：NDJSON 文本，不使用 msgpack / pickle / 任何二进制序列化；stdout 只放协议数据；引擎进程常驻（模型加载是分钟级），并发由前端排队。
+
+## 前端技术选型（2026-10）
+
+- Python + FastAPI + uvicorn；日志一律 stderr。
+- 对外提供 OpenAI（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）两种 API 方言，流式 + 非流式；实现参考 `/home/teaonly/workspace/all-infer/Strata/serve` 的 server.py（方言端点、SSE 事件形态、/v1/v1 别名、Bearer/x-api-key）。
+- 结构与 Strata 相反：它是 8700 行单文件 + stdlib http.server，myllm 按核心要求拆小模块。
+- 本机 Python 3.14 无 pip / python3-venv：环境一律用 uv 建（`uv venv .venv && uv pip install -r requirements.txt`）。
