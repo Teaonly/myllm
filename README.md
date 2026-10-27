@@ -5,7 +5,8 @@
 
 - [docs/hardware.md](docs/hardware.md) — 硬件、内存预算与两级驻留
 - [docs/model.md](docs/model.md) — 模型架构说明，含为什么自己写
-- [docs/architecture.md](docs/architecture.md) — 前后端职责与协议约定
+- [docs/architecture.md](docs/architecture.md) — 前后端职责与协议入口
+- [docs/protocol.md](docs/protocol.md) — 数据交互定义，复用 mini-sglang 消息设计
 
 ## 核心要求
 
