@@ -5,7 +5,7 @@ submit() 一个 UserMsg，拿到该 uid 专属的 asyncio.Queue 消费 token 流
 直到 finished=true 的 DetokenizeMsg 或 ErrorMsg（协议不变量 1）。
 
 后端崩溃（stdout EOF，协议的致命错误表达）以 EngineEOF 哨兵投入所有
-在途 queue，消费方不至于挂死；完整的中止/EOF/重启生命周期属计划第 9 步。
+在途 queue，消费方不至于挂死；完整的中止/EOF/重启生命周期属计划第 11 步。
 """
 
 import asyncio
@@ -52,8 +52,15 @@ class EngineProcess:
         self._reader = asyncio.create_task(self._read_loop())
 
     async def stop(self) -> None:
-        """优雅退出：ExitMsg → 等后端排空在途后退出；超时击杀兜底。"""
-        await self._send(ExitMsg())
+        """优雅退出：ExitMsg → 等后端排空在途后退出；超时击杀兜底。
+
+        后端已死（崩溃路径，stdout EOF）时 stdin 管道已断，发送会抛
+        ConnectionError——不当异常看，跳过发送直接等退场。
+        """
+        try:
+            await self._send(ExitMsg())
+        except ConnectionError:
+            pass
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=10)
         except TimeoutError:
