@@ -7,7 +7,7 @@
 ## 职责
 
 - **前端（HTTP API）**：面向客户端的 HTTP 服务，负责请求解析、tokenize / detokenize、会话与并发管理、流式输出（SSE / chunked）；不碰 GPU。
-- **后端（GPU 推理进程）**：加载模型，专注 prefill/decode 计算；不做网络 IO。
+- **后端（GPU 推理进程）**：加载模型，专注 prefill/decode 计算；不做网络 IO。**不用 Python 开发**，仓库内所有 Python 代码只存在于 frontend/；协议（[protocol.md](protocol.md)）是两侧唯一的共享契约，各自语言实现编解码。
 - **交互**：前端把请求写进后端的 stdin，后端逐 token 写回 stdout。两个独立进程，边界即模块边界。
 
 ## 为什么这样设计（对着三条核心要求）

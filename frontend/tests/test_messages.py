@@ -1,13 +1,13 @@
-"""messages 模块单测。运行（仓库根目录）：
+"""frontend.messages 单测。运行（仓库根目录）：
 
-    frontend/.venv/bin/python -m pytest tests -q
+    frontend/.venv/bin/python -m pytest frontend/tests -q
 """
 
 import json
 
 import pytest
 
-from messages import (
+from frontend.messages import (
     AbortBackendMsg,
     BatchBackendMsg,
     BatchTokenizerMsg,

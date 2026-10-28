@@ -1,6 +1,6 @@
-"""共享消息模块：前后端 NDJSON 协议的编解码，规范见 docs/protocol.md。
+"""协议消息：NDJSON 编解码的 Python 实现，规范见 docs/protocol.md。
 
-前端（HTTP API 进程）与后端（GPU 推理进程）共用这一份定义：
+后端不用 Python 开发，两侧按同一规范各自实现，本模块只服务前端：
 一行一个 JSON 对象，`__type__` 标明类型；解码忽略未知字段；
 Batch 包装语义等价于逐行发送，接收方必须解包。
 """
