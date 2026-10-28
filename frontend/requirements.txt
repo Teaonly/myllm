@@ -3,3 +3,4 @@ uvicorn
 tokenizers
 pytest
 httpx
+jinja2
