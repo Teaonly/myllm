@@ -3,11 +3,14 @@ import uvicorn
 from fastapi import FastAPI
 
 from .log import setup_logging
+from .openai_api import router as openai_router
 
 
 def create_app() -> FastAPI:
     setup_logging()
     app = FastAPI(title="myllm")
+
+    app.include_router(openai_router)
 
     @app.get("/health")
     def health() -> dict:
