@@ -1,26 +1,39 @@
-"""OpenAI 方言端点：/v1/models 与 /v1/chat/completions（非流式，流式属计划第 9 步）。
+"""OpenAI 方言端点：/v1/models 与 /v1/chat/completions（非流式 + 流式 SSE）。
 
 响应形态对齐 OpenAI 官方（openai SDK 可直接消费），错误体也用其 error 包裹
 而非 FastAPI 默认的 detail——客户端读的是 error.message / error.code。
 
 think 相关两处约定（2026-10-28，第 8 步落定）：
-- 生成文本里的思考内容映射到 message.reasoning_content（DeepSeek-R1 起的
-  事实标准，vLLM/SGLang/Strata 同款），content 只放 </think> 之后的回答；
+- 生成文本里的思考内容映射到 message/delta 的 reasoning_content（DeepSeek-R1
+  起的事实标准，vLLM/SGLang/Strata 同款），content 只放 </think> 之后的回答；
 - enable_thinking / reasoning_effort 作顶层请求字段（后者恰为 OpenAI 官方
   字段名），取值校验交给 chat 模板——模板即校验器，规则不两处维护。
+
+流式约定（第 9 步）：
+- SSE 逐 token 推 delta；usage 按 OpenAI 官方 stream_options.include_usage
+  语义，在收尾块前多发一条 choices=[] 的 usage chunk；
+- 开流前先等首条协议消息：首 token 之前的失败（超长/引擎崩溃）还没发出
+  任何字节，仍可用正经状态码报错；开流后的失败只能截流——不发
+  finish_reason 与 [DONE]，客户端凭流提前结束察觉异常。
 """
 
+import asyncio
+import json
+import logging
 import time
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .engine import EngineEOF, EngineProcess
-from .messages import ErrorMsg, SamplingParams, UserMsg
+from .messages import DetokenizeMsg, ErrorMsg, SamplingParams, UserMsg
+from .tokenizer import Tokenizer
+
+log = logging.getLogger("openai_api")
 
 # 本引擎单模型：id 即客户端在 chat/completions 里要填的 model 值。
 SERVED_MODEL_ID = "Qwen3.8-Flash-Next"
@@ -63,6 +76,12 @@ async def openai_validation_error(request: Request, exc: RequestValidationError)
     return _error(400, f"Invalid request: {details}")
 
 
+class StreamOptions(BaseModel):
+    """OpenAI 的 stream_options，目前只认 include_usage。"""
+
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     """/v1/chat/completions 请求体：只声明会用到的字段，其余（n、logprobs、
     tools、stop……）一律忽略，需要时再逐个实现。
@@ -76,6 +95,7 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[dict[str, Any]]
     stream: bool = False
+    stream_options: StreamOptions | None = None
     max_tokens: int = Field(default=1024, ge=1)
     temperature: float = 0.0
     top_p: float = 1.0
@@ -85,21 +105,74 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: str | None = None  # xhigh(默认)/medium/low，校验归模板
 
 
+class ThinkSplitStream:
+    """增量 think 拆分：流式文本 → ("reasoning_content"|"content", 增量) 事件。
+
+    思考段找 </think>：输出压住 len(TAG)-1 个字符，防止标签被切碎后当思考
+    内容漏出；命中后吞掉标签与其后全部前导 \\n（分隔 \\n\\n，同批量版
+    lstrip 口径）；回答段原样直发。开思考但直到流结束都没等到标签：全文
+    都算思考（思考被截断）。标签不是特殊 token，decode 不会剥掉，在解码
+    文本上拆即可。
+    """
+
+    TAG = "</think>"
+
+    def __init__(self, thinking: bool):
+        self._thinking = thinking  # False（关思考）：没有标签，直接回答段
+        self._skip_sep = False  # 刚越过标签，正在吞其后的 \n 分隔
+        self._buf = ""
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        """喂一段新增文本，返回本段可发的事件（可能为空：还在缓冲）。"""
+        self._buf += text
+        events: list[tuple[str, str]] = []
+        if self._thinking:
+            i = self._buf.find(self.TAG)
+            if i < 0:
+                hold = len(self.TAG) - 1  # 尾部这么多字符可能是半个标签
+                if len(self._buf) > hold:
+                    events.append(("reasoning_content", self._buf[:-hold]))
+                    self._buf = self._buf[-hold:]
+                return events
+            if i:
+                events.append(("reasoning_content", self._buf[:i]))
+            self._buf = self._buf[i + len(self.TAG) :]
+            self._thinking = False
+            self._skip_sep = True
+        if self._skip_sep:
+            stripped = self._buf.lstrip("\n")
+            if not stripped:  # 还是纯 \n（或空）：分隔没吞完，等下一段
+                self._buf = ""
+                return events
+            self._buf = stripped
+            self._skip_sep = False
+        if self._buf:
+            events.append(("content", self._buf))
+            self._buf = ""
+        return events
+
+    def flush(self) -> list[tuple[str, str]]:
+        """流结束：思考段压住的尾巴按思考发出；分隔段的残余 \\n 丢弃。"""
+        events: list[tuple[str, str]] = []
+        if self._thinking and self._buf:
+            events.append(("reasoning_content", self._buf))
+        self._buf = ""
+        return events
+
+
 def split_thinking(text: str, thinking: bool) -> tuple[str, str]:
     """生成文本 → (reasoning, content)：开思考按第一个 </think> 拆，关思考不拆。
 
-    开思考时输出 = 思考 + "</think>" + 回答（生成头 <think>\\n 在 prompt 里，
-    不占生成 token）；若直到收尾都没出现 </think>（思考被 max_tokens 截断），
-    全文都算思考、content 为空。标签不是特殊 token，decode 不会剥掉
-    （frontend/tokenizer.py 已验证），直接在解码文本上拆。
+    批量视图 = ThinkSplitStream 一次喂完再 flush——拆分语义只在状态机里
+    实现一份，流式与非流式天然同口径。开思考时输出 = 思考 + "</think>" +
+    回答（生成头 <think>\\n 在 prompt 里，不占生成 token）；没等到
+    </think>（思考被 max_tokens 截断）则全文都算思考、content 为空。
     """
-    if not thinking:
-        return "", text
-    reasoning, sep, answer = text.partition("</think>")
-    if not sep:
-        return text, ""
-    # 模型在 </think> 后固定接 \n\n 再写回答（模板历史格式同款），剥掉这段分隔
-    return reasoning, answer.lstrip("\n")
+    stream = ThinkSplitStream(thinking)
+    events = stream.feed(text) + stream.flush()
+    reasoning = "".join(d for field, d in events if field == "reasoning_content")
+    content = "".join(d for field, d in events if field == "content")
+    return reasoning, content
 
 
 @router.get("/v1/models")
@@ -116,12 +189,9 @@ def retrieve_model(model_id: str):
 
 @router.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
-    """非流式对话补全：messages → prompt ids（chat 模板）→ 引擎生成 → OpenAI 响应。"""
-    engine: EngineProcess = request.app.state.engine
+    """对话补全：非流式收满一次性返回；流式逐 token SSE（见 _stream_response）。"""
     if body.model != SERVED_MODEL_ID:
         return _error(404, f"The model '{body.model}' does not exist", code="model_not_found")
-    if body.stream:  # 流式属计划第 9 步：明确报错，不悄悄降级成非流式
-        return _error(400, "streaming is not supported yet")
 
     try:
         input_ids = request.app.state.chat_template.encode(
@@ -132,8 +202,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     except ValueError as exc:  # 模板即校验器：非法 messages / 非法 effort 都在这拦
         return _error(400, str(exc))
 
-    uid = engine.alloc_uid()
-    q = await engine.submit(
+    uid = request.app.state.engine.alloc_uid()
+    q = await request.app.state.engine.submit(
         UserMsg(
             uid=uid,
             input_ids=input_ids,
@@ -147,9 +217,19 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
     )
 
-    # 消费该 uid 的 token 流直到结束。结束方式恰三种：finished=true（正常收尾，
-    # 协议不变量 1）、ErrorMsg（单请求失败）、EngineEOF（引擎崩溃哨兵）——
-    # 后两者直接翻译成错误响应。
+    if body.stream:
+        return await _stream_response(body, request.app.state.tokenizer, input_ids, uid, q)
+    return await _non_stream_response(body, request.app.state.tokenizer, input_ids, q)
+
+
+async def _non_stream_response(
+    body: ChatCompletionRequest, tokenizer: Tokenizer, input_ids: list[int], q: asyncio.Queue
+):
+    """非流式：收满该 uid 的 token 流再一次返回。
+
+    结束方式恰三种：finished=true（正常收尾，协议不变量 1）、ErrorMsg
+    （单请求失败）、EngineEOF（引擎崩溃哨兵）——后两者直接翻译成错误响应。
+    """
     out_ids: list[int] = []
     while True:
         msg = await q.get()
@@ -161,10 +241,8 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         if msg.finished:
             break
 
-    # thinking 判据与模板一致（enable_thinking is undefined or is true）：
-    # None（未传）即开思考
-    thinking = body.enable_thinking is not False
-    reasoning, content = split_thinking(request.app.state.tokenizer.decode(out_ids), thinking)
+    thinking = body.enable_thinking is not False  # None（默认）即开，判据与模板一致
+    reasoning, content = split_thinking(tokenizer.decode(out_ids), thinking)
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning:
         message["reasoning_content"] = reasoning
@@ -188,3 +266,95 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
             "total_tokens": len(input_ids) + len(out_ids),
         },
     }
+
+
+async def _stream_response(
+    body: ChatCompletionRequest,
+    tokenizer: Tokenizer,
+    input_ids: list[int],
+    uid: int,
+    q: asyncio.Queue,
+) -> StreamingResponse | JSONResponse:
+    """流式 SSE。开流前先等首条消息：首 token 之前的失败（超长/引擎崩溃）
+    尚未发出任何字节，仍能用正经 HTTP 状态码报错，与非流式口径一致。"""
+    first = await q.get()
+    if isinstance(first, ErrorMsg):
+        return _error(400, first.message)
+    if isinstance(first, EngineEOF):
+        return _error(503, "engine process exited unexpectedly", err_type="server_error")
+    return StreamingResponse(
+        _sse_chunks(body, tokenizer, input_ids, uid, q, first),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+async def _sse_chunks(
+    body: ChatCompletionRequest,
+    tokenizer: Tokenizer,
+    input_ids: list[int],
+    uid: int,
+    q: asyncio.Queue,
+    first: DetokenizeMsg,
+):
+    """SSE data 行生成器：role 开场 → 增量解码 × think 拆分 → delta chunk
+    → finish_reason（+ usage 若请求）→ [DONE]。"""
+
+    cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
+        return {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": SERVED_MODEL_ID,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    def sse(obj: dict[str, Any]) -> str:
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    try:
+        yield sse(chunk({"role": "assistant", "content": ""}))
+
+        decoder = tokenizer.new_decode_stream()
+        splitter = ThinkSplitStream(thinking=body.enable_thinking is not False)
+        out_ids: list[int] = []
+        msg = first
+        while True:
+            if isinstance(msg, (ErrorMsg, EngineEOF)):  # 流中途失败：截流收场
+                log.warning("uid=%s 流中途中断: %r", uid, msg)
+                return
+            out_ids.append(msg.next_token)
+            for field, delta in splitter.feed(decoder.step(msg.next_token)):
+                yield sse(chunk({field: delta}))
+            if msg.finished:
+                break
+            msg = await q.get()
+
+        for field, delta in splitter.flush():
+            yield sse(chunk({field: delta}))
+
+        # 恰吐满 max_tokens 才可能是被截断；EOS 收尾时 token 数必小于它
+        yield sse(chunk({}, "length" if len(out_ids) >= body.max_tokens else "stop"))
+        if body.stream_options is not None and body.stream_options.include_usage:
+            yield sse(
+                {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": SERVED_MODEL_ID,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": len(input_ids),
+                        "completion_tokens": len(out_ids),
+                        "total_tokens": len(input_ids) + len(out_ids),
+                    },
+                }
+            )
+        yield "data: [DONE]\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        # 客户端断开：后端仍在白算，abort 留给计划第 11 步
+        log.warning("uid=%s 流被取消（客户端断开？），生成仍在后端继续", uid)
+        raise

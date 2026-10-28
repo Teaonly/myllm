@@ -55,6 +55,31 @@ def test_decode_skip_special():
     assert tk.decode(ids, skip_special_tokens=False) == "<|im_start|>你好<|im_end|>"
 
 
+def test_decode_stream_matches_batch():
+    """增量解码与批量同口径：逐 token step 的拼接 == decode 全量。"""
+    text = "<|im_start|>user\n你好，世界！🎮 缩写 I'm\ncode ```python\nx = 1```"
+    ids = tk.encode(text)
+    ds = tk.new_decode_stream()
+    assert "".join(ds.step(i) for i in ids) == tk.decode(ids)
+
+
+def test_decode_stream_buffers_split_utf8():
+    """多字节字符被 token 边界切开：切半期间零输出（绝无 U+FFFD），
+    拼齐才吐整字。"""
+    ids = tk.encode("🎮")
+    assert len(ids) > 1  # 前提：这个字确实被切开了
+    ds = tk.new_decode_stream()
+    assert "".join(ds.step(i) for i in ids[:-1]) == ""
+    assert ds.step(ids[-1]) == "🎮"
+
+
+def test_decode_stream_skips_specials():
+    """特殊 token 与批量 decode 同口径：直接跳过，不进增量文本。"""
+    ids = [tk.im_start_id, *tk.encode("你好，世界！"), tk.im_end_id]
+    ds = tk.new_decode_stream()
+    assert "".join(ds.step(i) for i in ids) == tk.decode(ids) == "你好，世界！"
+
+
 def test_empty_and_vocab_size():
     assert tk.encode("") == []
     assert tk.vocab_size == 248077  # 248044 基础 vocab + 33 added tokens

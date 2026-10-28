@@ -1,4 +1,4 @@
-"""frontend.openai_api 的 /v1/chat/completions（非流式）单测。
+"""frontend.openai_api 的 /v1/chat/completions 单测：非流式 + 流式 SSE。
 
 运行（仓库根目录）：
 
@@ -7,8 +7,10 @@
 lifespan 随 TestClient 的 with 语句起停：每个用例拉起、收掉一次假后端。
 echo 语义（frontend/fake_backend.py）：completion 的 token 流 = input_ids 的
 前 max_tokens 个——端到端期望值全部由此推出，不依赖真实模型。
+流式部分另含 ThinkSplitStream（增量 think 拆分状态机）的离线单测。
 """
 
+import json
 import threading
 
 from fastapi.testclient import TestClient
@@ -16,7 +18,7 @@ from fastapi.testclient import TestClient
 from frontend.chat_template import ChatTemplate
 from frontend.fake_backend import FAKE_MAX_INPUT_LEN
 from frontend.main import create_app
-from frontend.openai_api import SERVED_MODEL_ID
+from frontend.openai_api import SERVED_MODEL_ID, ThinkSplitStream, split_thinking
 from frontend.tokenizer import Tokenizer
 
 tk = Tokenizer()
@@ -104,16 +106,6 @@ def test_unknown_model_404():
     }
 
 
-def test_stream_not_supported_400():
-    with TestClient(create_app()) as client:
-        r = client.post(
-            "/v1/chat/completions",
-            json={"model": SERVED_MODEL_ID, "messages": MESSAGES, "stream": True},
-        )
-    assert r.status_code == 400
-    assert "streaming" in r.json()["error"]["message"]
-
-
 def test_invalid_messages_400():
     """模板即校验器：无 user 消息 → 模板 raise → API 映射 400。"""
     with TestClient(create_app()) as client:
@@ -185,3 +177,162 @@ def test_engine_crash_503():
         )
     assert r.status_code == 503
     assert r.json()["error"]["type"] == "server_error"
+
+
+# ---- ThinkSplitStream：增量 think 拆分状态机（流式核心，先离线压测） ----
+
+
+def _drain(pieces: list[str], thinking: bool) -> dict[str, str]:
+    """把若干段文本依次喂进 ThinkSplitStream，按字段拼接全部事件。"""
+    sp = ThinkSplitStream(thinking)
+    events = [e for piece in pieces for e in sp.feed(piece)] + sp.flush()
+    out: dict[str, str] = {}
+    for field, delta in events:
+        out[field] = out.get(field, "") + delta
+    return out
+
+
+def test_think_split_whole_at_once():
+    assert _drain(["思考</think>\n\n答案"], True) == {"reasoning_content": "思考", "content": "答案"}
+
+
+def test_think_split_tag_across_feeds():
+    """标签被切碎到多段喂入：既不漏标签碎片，也不丢思考内容。"""
+    out = _drain(["思考</", "thi", "nk>\n", "\n答", "案"], True)
+    assert out == {"reasoning_content": "思考", "content": "答案"}
+
+
+def test_think_split_no_tag_all_reasoning():
+    """没等到 </think>（思考被截断）：全文算思考，content 为空。"""
+    assert _drain(["还在思考", "……"], True) == {"reasoning_content": "还在思考……"}
+
+
+def test_think_split_tag_then_only_newlines():
+    """标签后只有 \\n：分隔全吞（同批量版 lstrip 口径），content 为空。"""
+    assert _drain(["想\n</think>\n\n\n"], True) == {"reasoning_content": "想\n"}
+
+
+def test_think_split_disabled_no_scan():
+    """关思考：不找标签，全文（含 </think> 字面量）原样进 content。"""
+    assert _drain(["直接回答</think>字面量"], False) == {"content": "直接回答</think>字面量"}
+
+
+def test_think_split_matches_batch_view():
+    """任意切段喂入 == 批量一次喂入（split_thinking）：流式/非流式同口径。"""
+    text = "让我想想</think>\n\n答案是 42"
+    reasoning, content = split_thinking(text, True)
+    for cut in (1, 3, 5, 7):
+        pieces = [text[i : i + cut] for i in range(0, len(text), cut)]
+        assert _drain(pieces, True) == {"reasoning_content": reasoning, "content": content}
+
+
+# ---- 流式 SSE 端到端 ----
+
+
+def _stream_data(client: TestClient, **payload) -> list[str]:
+    """发一个流式请求，返回 SSE data: 负载列表（正常结束时含 [DONE]）。"""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": SERVED_MODEL_ID, "messages": MESSAGES, "stream": True, **payload},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        return [ln[len("data: ") :] for ln in r.iter_lines() if ln.startswith("data: ")]
+
+
+def _parse_stream(data: list[str]) -> list[dict]:
+    """data 负载 → chunk 列表；断言结尾是 [DONE] 哨兵。"""
+    assert data[-1] == "[DONE]"
+    return [json.loads(d) for d in data[:-1]]
+
+
+def test_stream_completion():
+    """流式基本盘：role 开场块 → reasoning 增量（echo 无 </think>，全文思考）
+    → length 收尾 → [DONE]；拼接与非流式同口径，默认不带 usage。"""
+    with TestClient(create_app()) as client:
+        data = _stream_data(client, max_tokens=16)
+    chunks = _parse_stream(data)
+    assert len({c["id"] for c in chunks}) == 1
+    assert chunks[0]["id"].startswith("chatcmpl-")
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": ""}
+    assert all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1])
+    reasoning = "".join(
+        c["choices"][0]["delta"]["reasoning_content"]
+        for c in chunks
+        if "reasoning_content" in c["choices"][0]["delta"]
+    )
+    assert reasoning == tk.decode(PROMPT_IDS[:16])
+    assert not any(c["choices"][0]["delta"].get("content") for c in chunks)
+    assert chunks[-1]["choices"][0] == {"index": 0, "delta": {}, "finish_reason": "length"}
+    assert "usage" not in chunks[-1]
+
+
+def test_stream_disable_thinking_all_content():
+    """关思考流式：全文（含 prompt 里的空 think 块）原样进 content。"""
+    ids = ct.encode(MESSAGES, enable_thinking=False)
+    with TestClient(create_app()) as client:
+        data = _stream_data(client, max_tokens=8, enable_thinking=False)
+    chunks = _parse_stream(data)
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert content == tk.decode(ids[:8])
+    assert not any("reasoning_content" in c["choices"][0]["delta"] for c in chunks)
+    assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+
+
+def test_stream_include_usage():
+    """stream_options.include_usage：finish 收尾块之后、[DONE] 之前多一条
+    choices=[] 的 usage chunk（OpenAI 官方形态），数字与非流式一致。"""
+    with TestClient(create_app()) as client:
+        data = _stream_data(client, max_tokens=16, stream_options={"include_usage": True})
+    chunks = _parse_stream(data)
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": len(PROMPT_IDS),
+        "completion_tokens": 16,
+        "total_tokens": len(PROMPT_IDS) + 16,
+    }
+    assert chunks[-2]["choices"][0]["finish_reason"] == "length"
+
+
+def test_stream_finish_reason_stop():
+    """max_tokens 大于 prompt 长度：echo 自然排空（对应真后端的 EOS 收尾）。"""
+    with TestClient(create_app()) as client:
+        data = _stream_data(client, max_tokens=4096, stream_options={"include_usage": True})
+    chunks = _parse_stream(data)
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["usage"]["completion_tokens"] == len(PROMPT_IDS)
+
+
+def test_stream_backend_error_400():
+    """首 token 前的失败（超长）：一字节未发，仍是正经 400 JSON 错误体。"""
+    long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(4000))}]
+    with TestClient(create_app()) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SERVED_MODEL_ID,
+                "messages": long_messages,
+                "max_tokens": 8,
+                "stream": True,
+            },
+        )
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "context length exceeded"
+
+
+def test_stream_engine_crash_truncates():
+    """流中途引擎崩溃：已发的块照收，但没有 finish_reason 与 [DONE]——
+    客户端凭流提前结束察觉异常（开流后状态码已定，只能截流）。"""
+    app = create_app()
+    with TestClient(app) as client:
+        # ~3941 token 的 prompt（须 < 假后端 4096 上限），echo 每 token 20ms，
+        # 0.5s 时流必然还在途
+        long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}]
+        threading.Timer(0.5, app.state.engine._proc.kill).start()
+        data = _stream_data(client, messages=long_messages, max_tokens=4096)
+    assert "[DONE]" not in data
+    chunks = [json.loads(d) for d in data]
+    assert len(chunks) > 1  # 至少 role 块 + 若干 delta
+    assert all(c["choices"][0]["finish_reason"] is None for c in chunks)

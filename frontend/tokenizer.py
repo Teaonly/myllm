@@ -3,15 +3,33 @@
 只支持这一个模型，不做任何自动探测。运行时新依赖仅 tokenizers 一个，
 它就是 transformers 底下的同一引擎，行为与官方零偏差（正确性优先）。
 将来若换纯本地实现：保持本类对外接口不变（encode / decode / 特殊 token
-id 属性），调用方无感。
+id 属性 / new_decode_stream），调用方无感。
 """
 
 from pathlib import Path
 
 from tokenizers import Tokenizer as _RustTokenizer
+from tokenizers.decoders import DecodeStream as _RustDecodeStream
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TOKENIZER_JSON = REPO_ROOT / "Qwen3.8-Flash-Next" / "tokenizer.json"
+
+
+class DecodeStream:
+    """增量解码器（流式响应用）：逐 token 喂，返回该 token 新增的文本。
+
+    tokenizers 库 DecodeStream 的薄封装：多字节 UTF-8 字符被 token 边界
+    切开时由其内部字节缓冲（切半期间无输出），特殊 token 直接跳过——
+    语义与 Tokenizer.decode(skip_special_tokens=True) 逐批一致。
+    """
+
+    def __init__(self, tokenizer: _RustTokenizer):
+        self._tk = tokenizer
+        self._ds = _RustDecodeStream(skip_special_tokens=True)
+
+    def step(self, token_id: int) -> str:
+        """喂一个 token id，返回新增文本；无新增（字符缓冲中/特殊 token）为空串。"""
+        return self._ds.step(self._tk, token_id) or ""
 
 
 class Tokenizer:
@@ -32,6 +50,10 @@ class Tokenizer:
 
     def decode(self, ids: list[int], *, skip_special_tokens: bool = True) -> str:
         return self._tk.decode(ids, skip_special_tokens=skip_special_tokens)
+
+    def new_decode_stream(self) -> DecodeStream:
+        """新建增量解码器（见 DecodeStream）；有状态，每条生成流一个实例。"""
+        return DecodeStream(self._tk)
 
     def _required(self, content: str) -> int:
         tid = self._tk.token_to_id(content)
