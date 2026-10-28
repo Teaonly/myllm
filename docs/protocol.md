@@ -8,6 +8,7 @@
 - 对象带 `__type__` 字段标明消息类型，其余键即消息字段。
 - uid：int，请求粒度：一次生成（一个轮次）一个 uid；前端按发送顺序分配、全局单调递增，后端原样回带。完成顺序与 uid 大小无关。协议没有会话概念——多轮对话＝每轮一个新 UserMsg、新 uid，历史由前端全量并入 input_ids。
 - Batch 包装（`Batch*Msg`）可选：把多条消息合成一行发送，语义等价于逐行发送，接收方必须解包处理。
+- 解码端必须忽略消息中的未知字段——后续一切扩展的兼容基础。
 - `sampling_params` 内嵌对象：
 
 | 字段 | 类型 | 默认 | 含义 |
@@ -123,3 +124,37 @@ stdout：
 {"__type__":"DetokenizeMsg","uid":1,"next_token":104,"finished":false}
 {"__type__":"DetokenizeMsg","uid":1,"next_token":9370,"finished":true}
 ```
+
+## 扩展（预留，未实现）：图像输入
+
+为多模态输入预留。本节**当前不具约束力**：实现前双方都不得发送下列字段；写在这里是为了先把扩展路径定下来，避免将来破坏兼容。
+
+### 消息形态
+
+`UserMsg` 预留一个可选字段：
+
+```json
+{"__type__":"UserMsg","uid":1,"input_ids":[...,151664,...,151664,...],"sampling_params":{...},"images":["/tmp/myllm/img-1.png","/tmp/myllm/img-2.jpg"]}
+```
+
+- `images`：图像文件路径数组（本地绝对路径），与 `input_ids` 中**图像占位 token 的出现顺序一一对应**。
+- 占位符：一个保留的特殊 token id（具体数值实现时随 tokenizer 定稿，参照 Qwen VL 的 `<|image_pad|>`）。前端保证占位 token 出现次数 == len(images)；后端在该位置展开 vision encoder 输出的视觉 token。
+
+### 设计约束
+
+- 图像字节不上管道：协议行永远是文本。前端负责把客户端上传 / URL 拉取的图像落盘为本地文件；后端只在 prefill 时刻按路径读一次。
+- 纯文本请求不携带 `images`，行为与现协议完全一致。
+- 占位 token 出现次数与 len(images) 不符：返回 ErrorMsg。
+- 输出侧消息（DetokenizeMsg / ErrorMsg 等）形态不变。
+
+### 生命周期：图像文件与 KV Cache 的一致性
+
+- 规则：**图像文件的有效期 ≥ 携带它的 UserMsg 的生命周期**——发出 UserMsg 前文件必须存在，收到该 uid 的 `finished=true` 或 ErrorMsg 之后才允许删除。粒度与 uid 一致。
+- 依据：OpenAI / Anthropic API 语义下，图像内容随每次请求到达前端（base64 / URL），**每一轮重算的原料都随当轮 UserMsg 自带**。于是：
+  - KV 命中 → 后端不读文件；
+  - KV 逐出 → 下一轮请求重新携带图像，用当轮文件重算；
+  - 后端重启 → 同上。
+  后端读文件只发生在 prefill 时刻，不存在"稍后再读"，因此无需租约、释放消息或后端副本存储等跨进程协商。
+- 前端实现自由：每轮重新落盘、或对话内复用同一文件（对话结束再删）均可；硬约束只有有效期规则。
+- 前端删除过早（bug）→ 后端 prefill 读文件失败 → ErrorMsg，按单请求失败处理，不变量 1 不破。
+- 若将来引入"只传引用、不重复携带字节"的私有客户端，必须新增显式释放 / 所有权转移机制，届时再扩展，当前不预留。

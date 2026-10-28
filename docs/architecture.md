@@ -26,3 +26,4 @@
 - 对外提供 OpenAI（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）两种 API 方言，流式 + 非流式；实现参考 `/home/teaonly/workspace/all-infer/Strata/serve` 的 server.py（方言端点、SSE 事件形态、/v1/v1 别名、Bearer/x-api-key）。
 - 结构与 Strata 相反：它是 8700 行单文件 + stdlib http.server，myllm 按核心要求拆小模块。
 - 本机 Python 3.14 无 pip / python3-venv：环境一律用 uv 建（`uv venv .venv && uv pip install -r requirements.txt`）。
+- 图像落盘用内容寻址：sha256(原始字节) 作文件名（如 /var/tmp/myllm-img/<sha256>.<ext>）。同图同路径，天然去重、后端前缀缓存必命中；删除按 hash 引用计数归零执行（uid 开始 +1，finished/ErrorMsg −1），与协议的图像有效期规则对齐。
