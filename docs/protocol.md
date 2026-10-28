@@ -78,7 +78,7 @@ finished=true 的触发：命中 EOS（未开 ignore_eos）或达到 max_tokens�
   < DetokenizeMsg{uid=1, next_token, finished=true}   ← 收尾行
 ```
 
-中止前已产出的 token 全部有效；收尾行之后该 uid 不再有任何输出。
+中止前已产出的 token 全部有效；收尾行之后该 uid 不再有任何输出。收尾行的 `next_token` 无业务含义（假后端以 -1 占位）；接收方只认 `finished=true`，不得把该 token 计入输出。
 
 ### 4. 单请求失败
 
