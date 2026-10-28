@@ -20,10 +20,9 @@ from frontend.messages import (
     DetokenizeMsg,
     ErrorMsg,
     ExitMsg,
+    Message,
     SamplingParams,
     UserMsg,
-    decode_line,
-    encode,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,8 +54,8 @@ class FakeBackend:
 
         threading.Thread(target=_pump, daemon=True).start()
 
-    def send(self, msg) -> None:
-        self.proc.stdin.write(encode(msg))
+    def send(self, msg: Message) -> None:
+        self.proc.stdin.write(msg.encode())
         self.proc.stdin.flush()
 
     def read_msgs(self, n: int, timeout: float = 3.0) -> list:
@@ -70,7 +69,7 @@ class FakeBackend:
             except queue.Empty:
                 pytest.fail(f"读超时，只收到 {msgs!r}")
             assert line, f"后端提前退出，只收到 {msgs!r}"
-            msgs.extend(decode_line(line))
+            msgs.extend(Message.decode_line(line))
         return msgs
 
     def expect_exit(self, timeout: float = 3.0) -> None:

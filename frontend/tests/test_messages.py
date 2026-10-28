@@ -14,10 +14,9 @@ from frontend.messages import (
     DetokenizeMsg,
     ErrorMsg,
     ExitMsg,
+    Message,
     SamplingParams,
     UserMsg,
-    decode_line,
-    encode,
 )
 
 # 每种消息一个代表样本；非默认值确保字段确实经过序列化而不靠默认值巧合。
@@ -48,7 +47,7 @@ SAMPLES = [
 
 @pytest.mark.parametrize("msg", SAMPLES, ids=lambda m: m.MSG_TYPE)
 def test_round_trip(msg):
-    decoded = decode_line(encode(msg))
+    decoded = Message.decode_line(msg.encode())
     if isinstance(msg, (BatchBackendMsg, BatchTokenizerMsg)):
         assert decoded == msg.data
     else:
@@ -60,7 +59,7 @@ def test_user_msg_wire_format():
     msg = UserMsg(
         uid=1, input_ids=[151644, 872, 198], sampling_params=SamplingParams(max_tokens=256)
     )
-    assert json.loads(encode(msg)) == {
+    assert json.loads(msg.encode()) == {
         "__type__": "UserMsg",
         "uid": 1,
         "input_ids": [151644, 872, 198],
@@ -77,15 +76,15 @@ def test_user_msg_wire_format():
 
 def test_protocol_doc_examples():
     """协议文档「示例」一节的原始行必须原样可解。"""
-    assert decode_line(
+    assert Message.decode_line(
         '{"__type__":"UserMsg","uid":1,"input_ids":[151644,872,198],'
         '"sampling_params":{"__type__":"SamplingParams","temperature":0.0,'
         '"top_k":-1,"top_p":1.0,"ignore_eos":false,"max_tokens":256}}\n'
     ) == [UserMsg(uid=1, input_ids=[151644, 872, 198],
                   sampling_params=SamplingParams(max_tokens=256))]
-    assert decode_line('{"__type__":"AbortBackendMsg","uid":1}\n') == [AbortBackendMsg(uid=1)]
-    assert decode_line('{"__type__":"ExitMsg"}\n') == [ExitMsg()]
-    assert decode_line(
+    assert Message.decode_line('{"__type__":"AbortBackendMsg","uid":1}\n') == [AbortBackendMsg(uid=1)]
+    assert Message.decode_line('{"__type__":"ExitMsg"}\n') == [ExitMsg()]
+    assert Message.decode_line(
         '{"__type__":"DetokenizeMsg","uid":1,"next_token":104,"finished":false}\n'
     ) == [DetokenizeMsg(uid=1, next_token=104, finished=False)]
 
@@ -98,7 +97,7 @@ def test_batch_unwrapped():
             DetokenizeMsg(uid=2, next_token=6, finished=True),
         ]
     )
-    assert decode_line(encode(batch)) == batch.data
+    assert Message.decode_line(batch.encode()) == batch.data
 
 
 def test_ignore_unknown_fields():
@@ -116,27 +115,28 @@ def test_ignore_unknown_fields():
             "images": ["/tmp/myllm/img-1.png"],
         }
     )
-    (msg,) = decode_line(line)
+    (msg,) = Message.decode_line(line)
     assert msg == UserMsg(uid=1, input_ids=[1], sampling_params=SamplingParams(temperature=1.5))
 
 
 def test_missing_sampling_params_defaults():
-    (msg,) = decode_line('{"__type__":"UserMsg","uid":5,"input_ids":[]}')
+    (msg,) = Message.decode_line('{"__type__":"UserMsg","uid":5,"input_ids":[]}')
     assert msg.sampling_params == SamplingParams()
 
 
 def test_encode_single_line():
     """中文与换行：仍是恰好一个物理行（换行被 JSON 转义）。"""
-    line = encode(ErrorMsg(uid=1, message="失败\n第二行 中文"))
+    err = ErrorMsg(uid=1, message="失败\n第二行 中文")
+    line = err.encode()
     assert line.count("\n") == 1
     assert json.loads(line)["message"] == "失败\n第二行 中文"
 
 
 def test_unknown_type_rejected():
     with pytest.raises(ValueError, match="未知消息类型"):
-        decode_line(json.dumps({"__type__": "FutureMsg"}))
+        Message.decode_line(json.dumps({"__type__": "FutureMsg"}))
 
 
 def test_missing_type_rejected():
-    with pytest.raises(ValueError, match="顶层不是协议消息"):
-        decode_line(json.dumps({"uid": 1}))
+    with pytest.raises(ValueError, match="缺少 __type__"):
+        Message.decode_line(json.dumps({"uid": 1}))

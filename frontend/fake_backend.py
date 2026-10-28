@@ -18,15 +18,7 @@ import sys
 import time
 
 from .log import setup_logging
-from .messages import (
-    AbortBackendMsg,
-    DetokenizeMsg,
-    ErrorMsg,
-    ExitMsg,
-    UserMsg,
-    decode_line,
-    encode,
-)
+from .messages import AbortBackendMsg, DetokenizeMsg, ErrorMsg, ExitMsg, Message, UserMsg
 
 FAKE_MAX_INPUT_LEN = 4096  # 假上下文上限，超出走 ErrorMsg 路径
 TOKEN_DELAY_S = 0.02  # 每 token 间隔：模拟 decode 节奏，也留出 abort/并发窗口
@@ -52,7 +44,7 @@ def main() -> None:
             buf += chunk
             *lines, buf = buf.split(b"\n")
             for line in lines:
-                for msg in decode_line(line.decode("utf-8")):
+                for msg in Message.decode_line(line.decode("utf-8")):
                     active, exit_requested = _handle(msg, active, exit_requested)
         # 2) 每个 active uid 吐一个 token（轮转 → 不同 uid 交错）
         for uid in list(active):
@@ -95,8 +87,8 @@ def _handle(
     return active, exit_requested
 
 
-def _emit(msg: object) -> None:
-    sys.stdout.write(encode(msg))
+def _emit(msg: Message) -> None:
+    sys.stdout.write(msg.encode())
     sys.stdout.flush()
 
 
