@@ -8,7 +8,13 @@ jinja 环境与 transformers 同配置（trim_blocks / lstrip_blocks），并注
   enable_thinking=False 则完全不注入；
 - 生成头恒以 <think> 开头：开 thinking 追加 "<think>\\n"，
   关则完整空块 "<think>\\n\\n</think>\\n\\n"；
-- messages 必须含至少一条 user，system 只能是第一条，否则报错。
+- messages 必须含至少一条 user，system 只能是第一条，否则报错；
+- tools 传入且非空时渲染成 system 块的 # Tools 段（<tools> 内逐个整个对象
+  |tojson、不提取 .function）+ 调用格式说明；tool_choice 模板不认识，
+  由 API 层处理；
+- assistant 历史的 tool_calls 渲染成 <tool_call> 块，arguments 走 |items
+  只认 mapping（JSON 字符串要在 API 层先归一化）；role:"tool" 消息包成
+  <tool_response>、连续多条挂进同一个 user 块。
 """
 
 from pathlib import Path
@@ -32,6 +38,7 @@ class ChatTemplate:
         self,
         messages: list[dict],
         *,
+        tools: list[dict] | None = None,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
         add_generation_prompt: bool = True,
@@ -40,9 +47,11 @@ class ChatTemplate:
 
         消息合法性由模板把关（不支持的角色、system 位置、content 类型等
         模板都会 raise），本方法统一包装成 ValueError 冒泡——单一事实来源，
-        不在 Python 侧复刻规则。
+        不在 Python 侧复刻规则。tools 同样原样透传，形态归模板。
         """
         kwargs: dict = {"messages": messages, "add_generation_prompt": add_generation_prompt}
+        if tools is not None:
+            kwargs["tools"] = tools
         if enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
         if reasoning_effort is not None:
@@ -56,6 +65,7 @@ class ChatTemplate:
         self,
         messages: list[dict],
         *,
+        tools: list[dict] | None = None,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
         add_generation_prompt: bool = True,
@@ -64,6 +74,7 @@ class ChatTemplate:
         return self._tokenizer.encode(
             self.render(
                 messages,
+                tools=tools,
                 enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort,
                 add_generation_prompt=add_generation_prompt,

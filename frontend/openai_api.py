@@ -15,6 +15,13 @@ think 相关两处约定（2026-10-28，第 8 步落定）：
 - 开流前先等首条协议消息：首 token 之前的失败（超长/引擎崩溃）还没发出
   任何字节，仍可用正经状态码报错；开流后的失败只能截流——不发
   finish_reason 与 [DONE]，客户端凭流提前结束察觉异常。
+
+tool 约定（第 13a 步，输出侧解析在 13b/13c）：
+- tools 原样透传 chat 模板（prompt 里渲染 <tools> 清单 + 调用格式说明）；
+  tool_choice 模板没有此概念，只认 auto（默认，透传）/ none（不传 tools），
+  其余取值明确 400；
+- 历史 assistant 的 tool_calls[].function.arguments 若是 JSON 字符串
+  （OpenAI SDK 回放形态）先归一化成 dict：模板 |items 只认 mapping。
 """
 
 import asyncio
@@ -84,7 +91,7 @@ class StreamOptions(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     """/v1/chat/completions 请求体：只声明会用到的字段，其余（n、logprobs、
-    tools、stop……）一律忽略，需要时再逐个实现。
+    stop……）一律忽略，需要时再逐个实现。
 
     采样参数默认值取协议表（docs/protocol.md，temperature 0.0 即贪心），
     与 OpenAI 官方默认（temperature 1）不同：自用引擎取确定性优先。
@@ -103,6 +110,36 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     enable_thinking: bool | None = None  # None → 模板默认（开思考）
     reasoning_effort: str | None = None  # xhigh(默认)/medium/low，校验归模板
+    tools: list[dict[str, Any]] | None = None  # 透传模板渲染 <tools> 块
+    tool_choice: str | dict[str, Any] | None = None  # 仅 auto(默认)/none，其余 400
+
+
+def _normalize_tool_args(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """历史 assistant 消息 tool_calls[].function.arguments：JSON 字符串 → dict（原位改写）。
+
+    OpenAI SDK 会把上次响应的 tool_calls 原样回放——arguments 是 JSON 字符串；
+    而官方模板渲染历史时对 arguments 走 mapping 接口（|items），字符串直传
+    必炸（"Can only get item pairs from a mapping"）。归一化只做这一件事，
+    其余消息合法性仍由模板把关。
+    """
+    for message in messages:
+        for i, tool_call in enumerate(message.get("tool_calls") or ()):
+            fn = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if not (isinstance(fn, dict) and isinstance(fn.get("arguments"), str)):
+                continue  # dict 直传模板；别的形态交给模板去拦
+            raw = fn["arguments"]
+            try:
+                args = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"tool_calls[{i}].function.arguments is not valid JSON: {raw!r}"
+                ) from exc
+            if not isinstance(args, dict):
+                raise ValueError(
+                    f"tool_calls[{i}].function.arguments must be a JSON object: {raw!r}"
+                )
+            fn["arguments"] = args
+    return messages
 
 
 class ThinkSplitStream:
@@ -193,13 +230,21 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     if body.model != SERVED_MODEL_ID:
         return _error(404, f"The model '{body.model}' does not exist", code="model_not_found")
 
+    if body.tool_choice not in (None, "auto", "none"):
+        # 模板没有 tool_choice 概念；required / 指定函数得靠约束解码，先明确拒绝
+        return _error(
+            400, f"Unsupported tool_choice: {body.tool_choice!r} (only 'auto' or 'none')"
+        )
+
     try:
         input_ids = request.app.state.chat_template.encode(
-            body.messages,
+            _normalize_tool_args(body.messages),
+            # tool_choice="none"：不给模型看工具清单 → 模板不渲染 <tools> 块
+            tools=None if body.tool_choice == "none" else body.tools,
             enable_thinking=body.enable_thinking,
             reasoning_effort=body.reasoning_effort,
         )
-    except ValueError as exc:  # 模板即校验器：非法 messages / 非法 effort 都在这拦
+    except ValueError as exc:  # 模板即校验器 + arguments 归一化：都在这拦 → 400
         return _error(400, str(exc))
 
     uid = request.app.state.engine.alloc_uid()

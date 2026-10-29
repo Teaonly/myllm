@@ -13,12 +13,13 @@ echo 语义（frontend/fake_backend.py）：completion 的 token 流 = input_ids
 import json
 import threading
 
+import pytest
 from fastapi.testclient import TestClient
 
 from frontend.chat_template import ChatTemplate
 from frontend.fake_backend import FAKE_MAX_INPUT_LEN
 from frontend.main import create_app
-from frontend.openai_api import SERVED_MODEL_ID, ThinkSplitStream, split_thinking
+from frontend.openai_api import SERVED_MODEL_ID, ThinkSplitStream, _normalize_tool_args, split_thinking
 from frontend.tokenizer import Tokenizer
 
 tk = Tokenizer()
@@ -177,6 +178,148 @@ def test_engine_crash_503():
         )
     assert r.status_code == 503
     assert r.json()["error"]["type"] == "server_error"
+
+
+# ---- tools / tool_calls：请求侧接线（第 13a 步；输出侧解析在 13b/13c） ----
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询城市天气",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+# OpenAI SDK 回放形态：上次响应的 assistant tool_calls 原样塞回 messages，
+# arguments 是 JSON 字符串
+TOOL_ROUNDTRIP_MESSAGES = [
+    {"role": "user", "content": "北京天气"},
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "北京"}'},
+            }
+        ],
+    },
+    {"role": "tool", "content": "晴，25 度"},
+    {"role": "user", "content": "谢谢"},
+]
+
+
+def _post(client: TestClient, **payload):
+    """非流式请求的薄封装（messages 用默认 MESSAGES）。"""
+    return client.post(
+        "/v1/chat/completions",
+        json={"model": SERVED_MODEL_ID, "messages": MESSAGES, **payload},
+    )
+
+
+def test_tools_reach_prompt():
+    """tools 进 prompt：prompt_tokens 比不带 tools 的大。"""
+    with TestClient(create_app()) as client:
+        plain = _post(client, max_tokens=8, enable_thinking=False)
+        with_tools = _post(client, max_tokens=8, enable_thinking=False, tools=TOOLS)
+    assert with_tools.status_code == 200
+    assert with_tools.json()["usage"]["prompt_tokens"] > plain.json()["usage"]["prompt_tokens"]
+
+
+def test_tools_visible_in_echo():
+    """echo 全量回显 prompt：关思考 + 排空，content 里能看到 # Tools 段与工具名。"""
+    with TestClient(create_app()) as client:
+        r = _post(client, max_tokens=4096, enable_thinking=False, tools=TOOLS)
+    content = r.json()["choices"][0]["message"]["content"]
+    assert "# Tools" in content and "get_weather" in content
+
+
+def test_tool_choice_none_drops_tools():
+    """tool_choice=none：不给模型看工具清单，prompt 与不带 tools 完全一致。"""
+    with TestClient(create_app()) as client:
+        r = _post(client, max_tokens=8, enable_thinking=False, tools=TOOLS, tool_choice="none")
+        plain = _post(client, max_tokens=8, enable_thinking=False)
+    assert r.json()["usage"]["prompt_tokens"] == plain.json()["usage"]["prompt_tokens"]
+
+
+@pytest.mark.parametrize(
+    "choice",
+    ["required", {"type": "function", "function": {"name": "get_weather"}}],
+)
+def test_tool_choice_unsupported_400(choice):
+    """required / 指定函数需要约束解码，明确拒绝而不是静默当 auto。"""
+    with TestClient(create_app()) as client:
+        r = _post(client, max_tokens=8, tools=TOOLS, tool_choice=choice)
+    assert r.status_code == 400
+    assert "tool_choice" in r.json()["error"]["message"]
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_tool_history_roundtrip():
+    """SDK 回放形态的历史（arguments JSON 字符串 + role:"tool"）归一化后
+    模板可渲染；echo 回显 <function=get_weather> 与 <tool_response>。"""
+    with TestClient(create_app()) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": SERVED_MODEL_ID,
+                "messages": TOOL_ROUNDTRIP_MESSAGES,
+                "max_tokens": 4096,
+                "enable_thinking": False,
+            },
+        )
+    assert r.status_code == 200
+    content = r.json()["choices"][0]["message"]["content"]
+    assert "<function=get_weather>" in content
+    assert "<tool_response>\n晴，25 度\n</tool_response>" in content
+
+
+def test_tool_history_bad_arguments_json_400():
+    bad = [
+        {"role": "user", "content": "北京天气"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "function", "function": {"name": "get_weather", "arguments": "{oops}"}}
+            ],
+        },
+        {"role": "tool", "content": "晴"},
+        {"role": "user", "content": "谢谢"},
+    ]
+    with TestClient(create_app()) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": SERVED_MODEL_ID, "messages": bad, "max_tokens": 8},
+        )
+    assert r.status_code == 400
+    assert "not valid JSON" in r.json()["error"]["message"]
+
+
+def test_normalize_tool_args_str_to_dict():
+    """JSON 字符串 → dict 原位改写；dict 与无 tool_calls 的消息原样不动。"""
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": '{"a": 1}'}}]},
+    ]
+    _normalize_tool_args(msgs)
+    assert msgs[1]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+
+
+def test_normalize_tool_args_non_object_rejected():
+    """合法 JSON 但不是对象（数组/数字）也拦——模板 |items 只认 mapping。"""
+    with pytest.raises(ValueError, match="JSON object"):
+        _normalize_tool_args(
+            [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "[1]"}}]}]
+        )
 
 
 # ---- ThinkSplitStream：增量 think 拆分状态机（流式核心，先离线压测） ----

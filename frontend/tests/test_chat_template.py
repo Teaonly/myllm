@@ -128,3 +128,80 @@ def test_error_content_bad_type():
 def test_error_system_not_first():
     with pytest.raises(ValueError, match="System message must be at the beginning"):
         ct.render([{"role": "user", "content": "a"}, {"role": "system", "content": "b"}])
+
+
+# ---- tools 与 tool_calls 历史：模板原生支持，锁渲染形态 ----
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询城市天气",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+TOOL_TURNS = [
+    {"role": "user", "content": "北京天气"},
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {"city": "北京"}},
+            }
+        ],
+    },
+    {"role": "tool", "content": "晴，25 度"},
+    {"role": "user", "content": "谢谢"},
+]
+
+
+def test_render_tools_system_block():
+    """tools → 独立 system 块（# Tools + <tools> JSON 清单 + 调用格式说明）；
+    不传 tools 时整块消失。清单里是整个 tool 对象的 tojson（含 type 包装）。"""
+    out = ct.render(USER_HI, tools=TOOLS, enable_thinking=False)
+    assert out.startswith("<|im_start|>system\n# Tools\n\nYou have access to the following functions:")
+    assert "<tools>" in out and "get_weather" in out and "</tools>" in out
+    assert "<function=example_function_name>" in out  # 调用格式说明
+    assert "# Tools" not in ct.render(USER_HI, enable_thinking=False)
+
+
+def test_render_tools_merge_reasoning_instructions():
+    """开思考 + tools：effort 指令合并进同一个 system 块（不另起一块）。"""
+    out = ct.render(USER_HI, tools=TOOLS)
+    assert out.startswith(f"<|im_start|>system\n{XHIGH}\n\n# Tools")
+
+
+def test_render_tool_call_history():
+    """assistant 的 tool_calls 历史渲染成 <tool_call> 块（arguments 须 dict），
+    role:"tool" 的回复包成 <tool_response>、挂在 user 名下。"""
+    out = ct.render(TOOL_TURNS, enable_thinking=False)
+    assert (
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\n北京\n</parameter>\n</function>\n</tool_call>"
+    ) in out
+    assert "<|im_start|>user\n<tool_response>\n晴，25 度\n</tool_response><|im_end|>" in out
+
+
+def test_render_tool_call_arguments_string_rejected():
+    """模板对 arguments 只认 mapping——JSON 字符串直传必炸（所以 API 层
+    归一化 str→dict；此断言锁定模板行为，模板变更时能察觉）。"""
+    bad = [
+        {"role": "user", "content": "北京天气"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "get_weather", "arguments": '{"city": "北京"}'}}
+        ]},
+        {"role": "tool", "content": "晴"},
+        {"role": "user", "content": "谢谢"},
+    ]
+    with pytest.raises(ValueError, match="item pairs"):
+        ct.render(bad, enable_thinking=False)
