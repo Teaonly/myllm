@@ -10,6 +10,7 @@ echo 语义（frontend/fake_backend.py）：completion 的 token 流 = input_ids
 流式部分另含 ThinkSplitStream（增量 think 拆分状态机）的离线单测。
 """
 
+import contextlib
 import json
 import socket
 import threading
@@ -21,6 +22,7 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from frontend.chat_template import ChatTemplate
+from frontend.engine import EngineProcess
 from frontend.fake_backend import FAKE_MAX_INPUT_LEN
 from frontend.main import create_app
 from frontend.openai_api import SERVED_MODEL_ID, ThinkSplitStream, _normalize_tool_args, split_thinking
@@ -524,16 +526,12 @@ def test_stream_engine_crash_truncates():
     assert all(c["choices"][0]["finish_reason"] is None for c in chunks)
 
 
-def test_stream_client_disconnect_aborts():
-    """客户端断开（第 11 步·流式侧）：半途关流 → 生成器收到取消 → 发 abort
-    → 假后端立即收尾（next_token=-1 约定）→ uid 从登记表除名。
-
-    TestClient 模拟不了 TCP 断开，真起 uvicorn + httpx。判据 = 登记表
-    5s 内清空：若 abort 没生效，这条 ~3941 token 的流按 20ms/token 要
-    算 ~79s 才会自然除名，死线必超。
-    """
-    app = create_app()
-    # 自绑临时端口交给 uvicorn（0.54 的 Server 没暴露 sockets，端口我们说了算）
+@contextlib.contextmanager
+def _live_server(app):
+    """真起 uvicorn，yield 端口号。断开语义只能真服务器才有：TestClient 在
+    ASGI 层直接调 app，TCP 断开不会产生 http.disconnect。自绑 port=0 socket
+    交给 server.run(sockets=)——0.54 的 Server 没暴露 sockets 属性，端口我们
+    说了算。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     sock.listen(socket.SOMAXCONN)
@@ -546,6 +544,26 @@ def test_stream_client_disconnect_aborts():
         time.sleep(0.01)
     assert server.started, "uvicorn 未启动完成"
     try:
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+def _wait_uids_gone(engine: EngineProcess, timeout: float = 5.0) -> None:
+    """等登记表清空 = abort 生效的判据（不 abort 的话长请求按 20ms/token
+    要 ~79s 才自然除名，5s 死线必超）。"""
+    deadline = time.monotonic() + timeout
+    while engine._queues and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not engine._queues  # abort 收尾行已到，uid 除名
+
+
+def test_stream_client_disconnect_aborts():
+    """客户端断开（第 11 步·流式侧）：半途关流 → 生成器收到取消 → 发 abort
+    → 假后端立即收尾（next_token=-1 约定）→ uid 从登记表除名。"""
+    app = create_app()
+    with _live_server(app) as port:
         long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}]
         with httpx.Client(timeout=10) as hc:
             with hc.stream(
@@ -565,11 +583,41 @@ def test_stream_client_disconnect_aborts():
                     if seen >= 5:
                         break
                 assert seen == 5
+        _wait_uids_gone(app.state.engine)
+
+
+def test_nonstream_client_disconnect_aborts():
+    """客户端断开（第 11 步·非流式侧）：断开不取消协程、无异常可捕
+    （2026-10-28 实测），等 token 的超时轮询 is_disconnected 兜住 → 发
+    abort → 假后端立即收尾 → uid 从登记表除名。判据同流式侧。
+
+    弃连用裸 socket 发完请求立刻关：非流式的响应头要等算完才发，httpx
+    的 stream() 会卡在读头，断开只能在 socket 层制造。
+    """
+    app = create_app()
+    with _live_server(app) as port:
+        body = json.dumps(
+            {
+                "model": SERVED_MODEL_ID,
+                "messages": [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}],
+                "max_tokens": 4096,
+            }
+        ).encode()
+        request = (
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+        sock = socket.create_connection(("127.0.0.1", port))
+        sock.sendall(request)
+        # 先等生成真正在途（登记表非空）再弃连：客户端 FIN 若抢在 app 任务
+        # 读 body 之前到，uvicorn 会给 app 投 http.disconnect 而丢掉已缓冲
+        # 的请求体 → FastAPI 拿不到 JSON → 422 → 根本没有 submit，测试空转
         engine = app.state.engine
         deadline = time.monotonic() + 5
-        while engine._queues and time.monotonic() < deadline:
+        while not engine._queues and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert not engine._queues  # abort 收尾行已到，uid 除名
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)
+        assert engine._queues, "生成未在途（请求没走到 submit）"
+        sock.close()  # 算到一半，弃连
+        _wait_uids_gone(engine)

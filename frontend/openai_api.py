@@ -15,10 +15,12 @@ think 相关两处约定（2026-10-28，第 8 步落定）：
 - 开流前先等首条协议消息：首 token 之前的失败（超长/引擎崩溃）还没发出
   任何字节，仍可用正经状态码报错；开流后的失败只能截流——不发
   finish_reason 与 [DONE]，客户端凭流提前结束察觉异常。
-- 客户端断开：生成器收到 CancelledError/GeneratorExit → 发 abort 让后端
-  停算再传播取消（第 11 步·流式侧，TestClient 模拟不了 TCP 断开，测试真起
-  uvicorn）；非流式侧的断开无异常可捕，需轮询 is_disconnected 与 q.get
-  竞争，属第 11 步余下部分。
+- 客户端断开（第 11 步；TestClient 模拟不了 TCP 断开，测试真起 uvicorn）：
+  流式生成器收到 CancelledError/GeneratorExit → 发 abort 让后端停算再传播
+  取消；非流式协程不被取消、无异常可捕（uvicorn 对死连接静默丢响应），
+  等 token 以 0.5s 封顶、每轮探一次 is_disconnected（空闲靠超时路，生成中
+  token 源源不断超时打不着、靠每 token 路），断开即发 abort 停算、返回
+  无人读的 499（nginx 的 client closed request 惯用语）。
 
 tool 约定（13a 请求侧 + 13b 非流式输出侧；流式 delta 属 13c）：
 - 请求：tools 原样透传 chat 模板（prompt 里渲染 <tools> 清单 + 调用格式说明）；
@@ -55,6 +57,10 @@ log = logging.getLogger("openai_api")
 SERVED_MODEL_ID = "Qwen3.8-Flash-Next"
 # 固定 created（模型发布月，docs/model.md），响应稳定可测。
 SERVED_MODEL_CREATED = 1785542400  # 2026-08-01T00:00:00Z
+# 非流式等 token 的超时上限（秒）：到点探一次客户端断开。这只盖住空闲路
+# （prefill/TTFT）；生成中 token 每 ~20ms 一个、超时永远打不着，断开探测
+# 靠每 token 一探（见 _non_stream_response）。
+DISCONNECT_POLL_INTERVAL = 0.5
 
 router = APIRouter()
 
@@ -271,10 +277,10 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         )
     )
 
+    engine = request.app.state.engine
     if body.stream:
-        engine = request.app.state.engine
         return await _stream_response(body, request.app.state.tokenizer, engine, input_ids, uid, q)
-    return await _non_stream_response(body, request.app.state.tokenizer, input_ids, q)
+    return await _non_stream_response(body, request, request.app.state.tokenizer, engine, input_ids, uid, q)
 
 
 async def _abort_quietly(engine: EngineProcess, uid: int) -> None:
@@ -286,17 +292,43 @@ async def _abort_quietly(engine: EngineProcess, uid: int) -> None:
         log.warning("uid=%s abort 发送失败：引擎管道已断", uid)
 
 
+async def _abort_if_disconnected(request: Request, engine: EngineProcess, uid: int) -> bool:
+    """探一次客户端断开；断开则发 abort 停算并返回 True（调用方随即收摊）。"""
+    if not await request.is_disconnected():
+        return False
+    log.warning("uid=%s 非流式客户端断开，发 abort 停算", uid)
+    await _abort_quietly(engine, uid)
+    return True
+
+
 async def _non_stream_response(
-    body: ChatCompletionRequest, tokenizer: Tokenizer, input_ids: list[int], q: asyncio.Queue
+    body: ChatCompletionRequest,
+    request: Request,
+    tokenizer: Tokenizer,
+    engine: EngineProcess,
+    input_ids: list[int],
+    uid: int,
+    q: asyncio.Queue,
 ):
     """非流式：收满该 uid 的 token 流再一次返回。
 
-    结束方式恰三种：finished=true（正常收尾，协议不变量 1）、ErrorMsg
-    （单请求失败）、EngineEOF（引擎崩溃哨兵）——后两者直接翻译成错误响应。
+    结束方式四种：finished=true（正常收尾，协议不变量 1）、ErrorMsg（单请求
+    失败）、EngineEOF（引擎崩溃哨兵）——后两者翻译成错误响应；第四种客户端
+    断开不取消协程、无异常可捕，每轮循环探一次断开（等 token 以 0.5s 封顶：
+    空闲路靠超时，生成中 token 源源不断超时打不着、靠每 token 路），断开即
+    发 abort 停算并返回无人读的 499。abort 后不等收尾行：_dispatch 投递
+    收尾行时即除名，无人消费也除名。
     """
     out_ids: list[int] = []
     while True:
-        msg = await q.get()
+        try:
+            msg = await asyncio.wait_for(q.get(), timeout=DISCONNECT_POLL_INTERVAL)
+        except TimeoutError:
+            msg = None  # 空闲（prefill/TTFT）没等到 token，本轮只探断开
+        if await _abort_if_disconnected(request, engine, uid):
+            return _error(499, "client disconnected")
+        if msg is None:
+            continue
         if isinstance(msg, ErrorMsg):
             return _error(400, msg.message)
         if isinstance(msg, EngineEOF):
