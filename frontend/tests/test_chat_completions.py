@@ -461,6 +461,32 @@ def test_stream_finish_reason_stop():
     assert chunks[-1]["usage"]["completion_tokens"] == len(PROMPT_IDS)
 
 
+def test_stream_tool_calls_deltas():
+    """流式工具调用（借 echo 回放历史块）：content 不再带标记文本；
+    调用按 OpenAI 惯例拆两条 delta——id/name 开头 + 整段 arguments；
+    finish_reason=tool_calls。与非流式同口径（增量 == 批量有离线锁定）。"""
+    with TestClient(create_app()) as client:
+        data = _stream_data(
+            client,
+            messages=TOOL_ROUNDTRIP_MESSAGES,
+            max_tokens=4096,
+            enable_thinking=False,
+        )
+    chunks = _parse_stream(data)
+    deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+    content = "".join(d.get("content", "") for d in deltas)
+    assert "<function=get_weather>" not in content  # 块被收走
+    assert "<tool_response>\n晴，25 度\n</tool_response>" in content
+    tool_deltas = [d["tool_calls"][0] for d in deltas if "tool_calls" in d]
+    assert len(tool_deltas) == 2  # 惯例两条：id/name 头 + 整段 arguments
+    head, args = tool_deltas
+    assert head["index"] == args["index"] == 0
+    assert head["id"].startswith("call_") and head["type"] == "function"
+    assert head["function"] == {"name": "get_weather", "arguments": ""}
+    assert args["function"] == {"arguments": '{"city": "北京"}'}
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_stream_backend_error_400():
     """首 token 前的失败（超长）：一字节未发，仍是正经 400 JSON 错误体。"""
     long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(4000))}]

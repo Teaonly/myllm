@@ -1,4 +1,4 @@
-"""frontend.tool_calls 单测：批量 <tool_call> 解析（第 13b 步）。
+"""frontend.tool_calls 单测：批量 + 增量 <tool_call> 解析（第 13b/13c 步）。
 
 运行（仓库根目录）：
 
@@ -11,7 +11,9 @@ echo 后端吐不出工具调用输出，解析器以离线单测为主；端到
 
 import json
 
-from frontend.tool_calls import parse_tool_calls
+import pytest
+
+from frontend.tool_calls import ToolCallStream, parse_tool_calls, tool_call_deltas
 
 
 def test_plain_text_untouched():
@@ -120,3 +122,75 @@ def test_unclosed_parameter_malformed():
     calls, content = parse_tool_calls(text)
     assert calls == []
     assert content == text
+
+
+# ---- ToolCallStream：增量视图（13c），与批量版同口径 ----
+
+RICH_TEXT = (
+    "先说明一下。\n\n"
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\n北京\n</parameter>\n</function>\n</tool_call>\n"
+    "中间文字\n"
+    "<tool_call>\n结构坏\n</tool_call>\n"  # 闭合但结构不符 → 退回文本
+    "<tool_call>\n<function=b>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n"
+    "收尾\n<tool_call>\n<function=c>\n"  # 未闭合 → 截断块，丢弃
+)
+
+
+def _drain(pieces: list[str]) -> tuple[list[dict], str]:
+    """把若干段依次喂进 ToolCallStream，拼接全部事件。"""
+    stream = ToolCallStream()
+    events = [e for piece in pieces for e in stream.feed(piece)] + stream.flush()
+    calls = [payload for kind, payload in events if kind == "tool_call"]
+    content = "".join(payload for kind, payload in events if kind == "content")
+    return calls, content
+
+
+@pytest.mark.parametrize("cut", [1, 3, 5, 7, 11])
+def test_stream_matches_batch_view(cut):
+    """任意切段喂入 == 批量一次喂入（标记切碎、值行切碎都拆不散语义）。"""
+    pieces = [RICH_TEXT[i : i + cut] for i in range(0, len(RICH_TEXT), cut)]
+    calls, content = _drain(pieces)
+    batch_calls, batch_content = parse_tool_calls(RICH_TEXT)
+    shape = lambda cs: [(c["function"]["name"], c["function"]["arguments"]) for c in cs]  # noqa: E731
+    assert shape(calls) == shape(batch_calls)  # id 随机生成，比语义字段
+    assert content == batch_content
+    # 锚定批量结果本身：两个完整块、坏块退回、截断块丢弃
+    assert shape(calls) == [("get_weather", '{"city": "北京"}'), ("b", '{"x": 1}')]
+    assert "中间文字" in content and "结构坏" in content and "收尾" in content
+    assert "<function=get_weather>" not in content and "<function=c>" not in content
+
+
+def test_stream_event_order_interleaved():
+    """一次喂入含块的文本：事件序与文本序一致——块前 content → 调用 → 块后 content。"""
+    stream = ToolCallStream()
+    events = stream.feed("前文\n<tool_call>\n<function=f>\n</function>\n</tool_call>\n后文")
+    events += stream.flush()
+    assert [kind for kind, _ in events] == ["content", "tool_call", "content"]
+    assert events[0][1] == "前文"
+    assert events[1][1]["function"]["name"] == "f"
+    assert events[2][1] == "\n后文"
+
+
+def test_stream_trailing_newline_semantics():
+    """结尾 \\n 与不结尾：content 恰差一个换行（= 批量 split 空尾行的口径）。"""
+    assert _drain(["块外文本\n"])[1] == "块外文本\n"
+    assert _drain(["块外文本"])[1] == "块外文本"
+
+
+def test_tool_call_deltas_payload_pair():
+    """完整调用 → 两条 delta 负载：id/name 头（arguments 空）+ 整段 arguments；
+    index 透传；不带 chunk 信封 / SSE 行（那是 API 层的事）。"""
+    call = {
+        "id": "call_x",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city": "北京"}'},
+    }
+    assert tool_call_deltas(call, 3) == [
+        {
+            "index": 3,
+            "id": "call_x",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": ""},
+        },
+        {"index": 3, "function": {"arguments": '{"city": "北京"}'}},
+    ]

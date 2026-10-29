@@ -21,10 +21,11 @@ tool 约定（13a 请求侧 + 13b 非流式输出侧；流式 delta 属 13c）�
   tool_choice 模板没有此概念，只认 auto（默认，透传）/ none（不传 tools），
   其余取值明确 400；历史 assistant 的 tool_calls[].function.arguments 若是
   JSON 字符串（OpenAI SDK 回放形态）先归一化成 dict：模板 |items 只认 mapping；
-- 非流式输出：think 拆分后的 content 再走 parse_tool_calls（frontend/tool_calls）
-  ——完整 <tool_call> 块装配成 message.tool_calls、finish_reason="tool_calls"，
-  截断的半个块丢弃（finish_reason 仍 length）；流式的 tool_calls delta 在
-  13c，当前流式 content 仍会原样带出标记文本。
+- 输出：think 拆分后的 content 再过 tool_calls 解析（frontend/tool_calls）——
+  完整 <tool_call> 块装配成 tool_calls、finish_reason="tool_calls"，截断的
+  半个块丢弃（finish_reason 优先级 length > tool_calls > stop）；流式同口径：
+  content 增量再过 ToolCallStream，完整调用原子发两条 delta（id/name 开头 +
+  整段 arguments，OpenAI 惯例拆法），index 按发射序递增。
 """
 
 import asyncio
@@ -42,7 +43,7 @@ from pydantic import BaseModel, Field
 from .engine import EngineEOF, EngineProcess
 from .messages import DetokenizeMsg, ErrorMsg, SamplingParams, UserMsg
 from .tokenizer import Tokenizer
-from .tool_calls import parse_tool_calls
+from .tool_calls import ToolCallStream, parse_tool_calls, tool_call_deltas
 
 log = logging.getLogger("openai_api")
 
@@ -354,8 +355,8 @@ async def _sse_chunks(
     q: asyncio.Queue,
     first: DetokenizeMsg,
 ):
-    """SSE data 行生成器：role 开场 → 增量解码 × think 拆分 → delta chunk
-    → finish_reason（+ usage 若请求）→ [DONE]。"""
+    """SSE data 行生成器：role 开场 → 增量解码 × think 拆分 × 工具拆分 →
+    delta chunk → finish_reason（+ usage 若请求）→ [DONE]。"""
 
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -377,6 +378,33 @@ async def _sse_chunks(
 
         decoder = tokenizer.new_decode_stream()
         splitter = ThinkSplitStream(thinking=body.enable_thinking is not False)
+        tooler = ToolCallStream()  # content 段再拆工具调用（13c）
+        n_calls = 0  # 已发射的调用数 = 下一个调用的 index
+
+        def tool_deltas(events) -> list[str]:
+            # 工具事件 → SSE 行：content 直发；调用按 OpenAI 惯例拆两条 delta
+            # （负载形态见 tool_calls.tool_call_deltas，这里只包信封）
+            nonlocal n_calls
+            lines: list[str] = []
+            for kind, payload in events:
+                if kind == "content":
+                    lines.append(sse(chunk({"content": payload})))
+                else:
+                    for delta in tool_call_deltas(payload, n_calls):
+                        lines.append(sse(chunk({"tool_calls": [delta]})))
+                    n_calls += 1
+            return lines
+
+        def splitter_deltas(events) -> list[str]:
+            # think 拆分事件 → SSE 行：reasoning 直发，content 段再过工具解析
+            lines: list[str] = []
+            for field, delta in events:
+                if field != "content":
+                    lines.append(sse(chunk({field: delta})))
+                else:
+                    lines.extend(tool_deltas(tooler.feed(delta)))
+            return lines
+
         out_ids: list[int] = []
         msg = first
         while True:
@@ -384,17 +412,20 @@ async def _sse_chunks(
                 log.warning("uid=%s 流中途中断: %r", uid, msg)
                 return
             out_ids.append(msg.next_token)
-            for field, delta in splitter.feed(decoder.step(msg.next_token)):
-                yield sse(chunk({field: delta}))
+            for line in splitter_deltas(splitter.feed(decoder.step(msg.next_token))):
+                yield line
             if msg.finished:
                 break
             msg = await q.get()
 
-        for field, delta in splitter.flush():
-            yield sse(chunk({field: delta}))
+        for line in splitter_deltas(splitter.flush()):
+            yield line
+        for line in tool_deltas(tooler.flush()):  # 工具流收尾：最后的半行 content
+            yield line
 
-        # 恰吐满 max_tokens 才可能是被截断；EOS 收尾时 token 数必小于它
-        yield sse(chunk({}, "length" if len(out_ids) >= body.max_tokens else "stop"))
+        # 截断 > 有调用 > 正常收尾（口径同非流式：截断时调用可能不完整）
+        finish = "length" if len(out_ids) >= body.max_tokens else "tool_calls" if n_calls else "stop"
+        yield sse(chunk({}, finish))
         if body.stream_options is not None and body.stream_options.include_usage:
             yield sse(
                 {
