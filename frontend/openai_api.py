@@ -15,6 +15,10 @@ think 相关两处约定（2026-10-28，第 8 步落定）：
 - 开流前先等首条协议消息：首 token 之前的失败（超长/引擎崩溃）还没发出
   任何字节，仍可用正经状态码报错；开流后的失败只能截流——不发
   finish_reason 与 [DONE]，客户端凭流提前结束察觉异常。
+- 客户端断开：生成器收到 CancelledError/GeneratorExit → 发 abort 让后端
+  停算再传播取消（第 11 步·流式侧，TestClient 模拟不了 TCP 断开，测试真起
+  uvicorn）；非流式侧的断开无异常可捕，需轮询 is_disconnected 与 q.get
+  竞争，属第 11 步余下部分。
 
 tool 约定（13a 请求侧 + 13b 非流式输出侧；流式 delta 属 13c）：
 - 请求：tools 原样透传 chat 模板（prompt 里渲染 <tools> 清单 + 调用格式说明）；
@@ -268,8 +272,18 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
     )
 
     if body.stream:
-        return await _stream_response(body, request.app.state.tokenizer, input_ids, uid, q)
+        engine = request.app.state.engine
+        return await _stream_response(body, request.app.state.tokenizer, engine, input_ids, uid, q)
     return await _non_stream_response(body, request.app.state.tokenizer, input_ids, q)
+
+
+async def _abort_quietly(engine: EngineProcess, uid: int) -> None:
+    """取消收尾里发 abort：引擎管道已断（崩溃路径）时发送会抛 ConnectionError，
+    吞掉并记日志——此时已没有在途生成可停了。"""
+    try:
+        await engine.abort(uid)
+    except ConnectionError:
+        log.warning("uid=%s abort 发送失败：引擎管道已断", uid)
 
 
 async def _non_stream_response(
@@ -329,19 +343,25 @@ async def _non_stream_response(
 async def _stream_response(
     body: ChatCompletionRequest,
     tokenizer: Tokenizer,
+    engine: EngineProcess,
     input_ids: list[int],
     uid: int,
     q: asyncio.Queue,
 ) -> StreamingResponse | JSONResponse:
     """流式 SSE。开流前先等首条消息：首 token 之前的失败（超长/引擎崩溃）
     尚未发出任何字节，仍能用正经 HTTP 状态码报错，与非流式口径一致。"""
-    first = await q.get()
+    try:
+        first = await q.get()
+    except asyncio.CancelledError:
+        # 断开发生在开流之前（保险路径：此窗口服务器是否取消任务随实现而异）
+        await _abort_quietly(engine, uid)
+        raise
     if isinstance(first, ErrorMsg):
         return _error(400, first.message)
     if isinstance(first, EngineEOF):
         return _error(503, "engine process exited unexpectedly", err_type="server_error")
     return StreamingResponse(
-        _sse_chunks(body, tokenizer, input_ids, uid, q, first),
+        _sse_chunks(body, tokenizer, engine, input_ids, uid, q, first),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
@@ -350,6 +370,7 @@ async def _stream_response(
 async def _sse_chunks(
     body: ChatCompletionRequest,
     tokenizer: Tokenizer,
+    engine: EngineProcess,
     input_ids: list[int],
     uid: int,
     q: asyncio.Queue,
@@ -443,6 +464,8 @@ async def _sse_chunks(
             )
         yield "data: [DONE]\n\n"
     except (asyncio.CancelledError, GeneratorExit):
-        # 客户端断开：后端仍在白算，abort 留给计划第 11 步
-        log.warning("uid=%s 流被取消（客户端断开？），生成仍在后端继续", uid)
+        # 客户端断开（第 11 步·流式侧）：发 abort 让后端停算，再传播取消。
+        # 取消收尾里的 await 是安全的：管道健康时 drain 即刻完成。
+        log.warning("uid=%s 流被取消（客户端断开？），发 abort 停算", uid)
+        await _abort_quietly(engine, uid)
         raise

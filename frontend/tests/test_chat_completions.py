@@ -11,9 +11,13 @@ echo 语义（frontend/fake_backend.py）：completion 的 token 流 = input_ids
 """
 
 import json
+import socket
 import threading
+import time
 
+import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from frontend.chat_template import ChatTemplate
@@ -518,3 +522,54 @@ def test_stream_engine_crash_truncates():
     chunks = [json.loads(d) for d in data]
     assert len(chunks) > 1  # 至少 role 块 + 若干 delta
     assert all(c["choices"][0]["finish_reason"] is None for c in chunks)
+
+
+def test_stream_client_disconnect_aborts():
+    """客户端断开（第 11 步·流式侧）：半途关流 → 生成器收到取消 → 发 abort
+    → 假后端立即收尾（next_token=-1 约定）→ uid 从登记表除名。
+
+    TestClient 模拟不了 TCP 断开，真起 uvicorn + httpx。判据 = 登记表
+    5s 内清空：若 abort 没生效，这条 ~3941 token 的流按 20ms/token 要
+    算 ~79s 才会自然除名，死线必超。
+    """
+    app = create_app()
+    # 自绑临时端口交给 uvicorn（0.54 的 Server 没暴露 sockets，端口我们说了算）
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(socket.SOMAXCONN)
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started, "uvicorn 未启动完成"
+    try:
+        long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}]
+        with httpx.Client(timeout=10) as hc:
+            with hc.stream(
+                "POST",
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json={
+                    "model": SERVED_MODEL_ID,
+                    "messages": long_messages,
+                    "max_tokens": 4096,
+                    "stream": True,
+                },
+            ) as r:
+                assert r.status_code == 200
+                seen = 0
+                for _ in r.iter_lines():  # 读开头几行就关流 = 客户端断开
+                    seen += 1
+                    if seen >= 5:
+                        break
+                assert seen == 5
+        engine = app.state.engine
+        deadline = time.monotonic() + 5
+        while engine._queues and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not engine._queues  # abort 收尾行已到，uid 除名
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)

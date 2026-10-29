@@ -5,7 +5,9 @@ submit() 一个 UserMsg，拿到该 uid 专属的 asyncio.Queue 消费 token 流
 直到 finished=true 的 DetokenizeMsg 或 ErrorMsg（协议不变量 1）。
 
 后端崩溃（stdout EOF，协议的致命错误表达）以 EngineEOF 哨兵投入所有
-在途 queue，消费方不至于挂死；完整的中止/EOF/重启生命周期属计划第 11 步。
+在途 queue，消费方不至于挂死。abort 能力本类已具备（abort→AbortBackendMsg，
+后端按 next_token=-1 收尾行结束）；API 层流式断开已接（第 11 步·流式侧），
+非流式侧断开与重启生命周期属第 11 步余下部分。
 """
 
 import asyncio
