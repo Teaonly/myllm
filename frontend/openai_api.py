@@ -16,12 +16,15 @@ think 相关两处约定（2026-10-28，第 8 步落定）：
   任何字节，仍可用正经状态码报错；开流后的失败只能截流——不发
   finish_reason 与 [DONE]，客户端凭流提前结束察觉异常。
 
-tool 约定（第 13a 步，输出侧解析在 13b/13c）：
-- tools 原样透传 chat 模板（prompt 里渲染 <tools> 清单 + 调用格式说明）；
+tool 约定（13a 请求侧 + 13b 非流式输出侧；流式 delta 属 13c）：
+- 请求：tools 原样透传 chat 模板（prompt 里渲染 <tools> 清单 + 调用格式说明）；
   tool_choice 模板没有此概念，只认 auto（默认，透传）/ none（不传 tools），
-  其余取值明确 400；
-- 历史 assistant 的 tool_calls[].function.arguments 若是 JSON 字符串
-  （OpenAI SDK 回放形态）先归一化成 dict：模板 |items 只认 mapping。
+  其余取值明确 400；历史 assistant 的 tool_calls[].function.arguments 若是
+  JSON 字符串（OpenAI SDK 回放形态）先归一化成 dict：模板 |items 只认 mapping；
+- 非流式输出：think 拆分后的 content 再走 parse_tool_calls（frontend/tool_calls）
+  ——完整 <tool_call> 块装配成 message.tool_calls、finish_reason="tool_calls"，
+  截断的半个块丢弃（finish_reason 仍 length）；流式的 tool_calls delta 在
+  13c，当前流式 content 仍会原样带出标记文本。
 """
 
 import asyncio
@@ -39,6 +42,7 @@ from pydantic import BaseModel, Field
 from .engine import EngineEOF, EngineProcess
 from .messages import DetokenizeMsg, ErrorMsg, SamplingParams, UserMsg
 from .tokenizer import Tokenizer
+from .tool_calls import parse_tool_calls
 
 log = logging.getLogger("openai_api")
 
@@ -288,9 +292,12 @@ async def _non_stream_response(
 
     thinking = body.enable_thinking is not False  # None（默认）即开，判据与模板一致
     reasoning, content = split_thinking(tokenizer.decode(out_ids), thinking)
+    tool_calls, content = parse_tool_calls(content)  # 回答段再拆工具调用（13b）
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning:
         message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -301,8 +308,13 @@ async def _non_stream_response(
             {
                 "index": 0,
                 "message": message,
-                # 恰吐满 max_tokens 才可能是被截断；EOS 收尾时 token 数必小于它
-                "finish_reason": "length" if len(out_ids) >= body.max_tokens else "stop",
+                # 截断 > 有调用 > 正常收尾：被截断时调用可能不完整（半个块
+                # 已被 parse_tool_calls 丢弃），length 优先好让客户端知道输出被切了
+                "finish_reason": (
+                    "length"
+                    if len(out_ids) >= body.max_tokens
+                    else "tool_calls" if tool_calls else "stop"
+                ),
             }
         ],
         "usage": {

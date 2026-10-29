@@ -235,11 +235,16 @@ def test_tools_reach_prompt():
 
 
 def test_tools_visible_in_echo():
-    """echo 全量回显 prompt：关思考 + 排空，content 里能看到 # Tools 段与工具名。"""
+    """echo 全量回显 prompt：关思考 + 排空，content 里能看到 # Tools 段与工具名。
+
+    echo 伪影顺便锁一个行为：prompt 里调用格式的"示例块"结构完整，
+    会被 13b 的解析器当真收走（真实模型不会回显 prompt，测试替身才会）。"""
     with TestClient(create_app()) as client:
         r = _post(client, max_tokens=4096, enable_thinking=False, tools=TOOLS)
-    content = r.json()["choices"][0]["message"]["content"]
-    assert "# Tools" in content and "get_weather" in content
+    message = r.json()["choices"][0]["message"]
+    assert "# Tools" in message["content"] and "get_weather" in message["content"]
+    assert message["tool_calls"][0]["function"]["name"] == "example_function_name"
+    assert r.json()["choices"][0]["finish_reason"] == "tool_calls"
 
 
 def test_tool_choice_none_drops_tools():
@@ -265,7 +270,9 @@ def test_tool_choice_unsupported_400(choice):
 
 def test_tool_history_roundtrip():
     """SDK 回放形态的历史（arguments JSON 字符串 + role:"tool"）归一化后
-    模板可渲染；echo 回显 <function=get_weather> 与 <tool_response>。"""
+    模板可渲染；借 echo 的 prompt 回显走通 13b 全链路（decode → think 拆分
+    → 工具解析）：回放进去的 <tool_call> 块被解析回结构化 tool_calls，
+    内容一致——arguments 闭环（str → dict → 模板 → 文本 → dict → str）。"""
     with TestClient(create_app()) as client:
         r = client.post(
             "/v1/chat/completions",
@@ -277,9 +284,15 @@ def test_tool_history_roundtrip():
             },
         )
     assert r.status_code == 200
-    content = r.json()["choices"][0]["message"]["content"]
-    assert "<function=get_weather>" in content
-    assert "<tool_response>\n晴，25 度\n</tool_response>" in content
+    choice = r.json()["choices"][0]
+    message = choice["message"]
+    assert "<function=get_weather>" not in message["content"]  # 块被收走
+    assert "<tool_response>\n晴，25 度\n</tool_response>" in message["content"]
+    assert message["tool_calls"][0]["id"].startswith("call_")
+    assert message["tool_calls"][0]["type"] == "function"
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "北京"}
+    assert choice["finish_reason"] == "tool_calls"
 
 
 def test_tool_history_bad_arguments_json_400():
