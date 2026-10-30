@@ -3,11 +3,14 @@
 原架构全尺寸逐层校验数据，由标准 Transformers（本地 main 分支
 `/home/teaonly/workspace/transformers`，5.22.0.dev0）+ 固定种子随机权重生成，
 无任何权重下载，结果逐位可复现。生成脚本：`gen_golden_full.py`。
-## 环境
 
-- 新 venv：`/home/teaonly/workspace/myllm/venv`（torch 2.13.0+cu130 通过符号链接复用
-  `pytorch.env`，transformers editable 装自本地 main，未改动 pytorch.env）
-- 运行：`/home/teaonly/workspace/myllm/venv/bin/python gen_golden_full.py`
+## 环境（独立于 repo 根，全部在 verify/ 之下）
+
+- venv：`verify/.venv`（torch 2.13.0+cu130 通过符号链接复用
+  `/home/teaonly/workspace/pytorch.env`；transformers editable 装自本地 main
+  检出 `/home/teaonly/workspace/transformers`，含 qwen4_exp）
+- 构建方法见 `requirements.txt` 头部注释
+- 运行：`./.venv/bin/python gen_golden_full.py`（在 verify/ 目录下）
 
 ## 全尺寸逐层方案（full_out/）
 

@@ -1,0 +1,31 @@
+# verify/.venv 依赖清单
+#
+# 环境构建（torch 通过符号链接复用 pytorch.env，避免重新下载 CUDA torch）：
+#
+#   SP=/home/teaonly/workspace/pytorch.env/lib/python3.12/site-packages
+#   V=.venv
+#   /home/teaonly/workspace/pytorch.env/bin/python -m venv --without-pip $V
+#   LINK=$V/lib/python3.12/site-packages/torch_env && mkdir -p $LINK
+#   for p in torch torchgen functorch nvidia triton triton-3.7.1.dist-info \
+#            filelock fsspec jinja2 networkx mpmath typing_extensions.py \
+#            typing_extensions-4.16.0.dist-info sympy sympy-1.14.0.dist-info \
+#            markupsafe markupsafe-3.0.3.dist-info; do
+#       ln -sfn $SP/$p $LINK/$p
+#   done
+#   echo $LINK > $V/lib/python3.12/site-packages/torch_link.pth
+#   /home/teaonly/workspace/pytorch.env/bin/pip --python $V/bin/python install -r requirements.txt
+#
+# 注意 transformers 必须是本地 main 检出（含 qwen4_exp）：
+#   /home/teaonly/workspace/transformers  @ git main (f90e93c4)
+
+# -e /home/teaonly/workspace/transformers  # qwen4_exp 支持，editable 安装
+transformers @ git+https://github.com/huggingface/transformers@main
+torch==2.13.0+cu130        # 由 torch_env 符号链接提供，勿重复安装
+numpy==2.5.4
+safetensors==0.8.0
+tokenizers==0.23.3
+huggingface_hub==2.4.0
+tqdm==4.70.1
+regex==2026.9.29
+pyyaml==6.0.3
+packaging==26.3
