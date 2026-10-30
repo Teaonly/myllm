@@ -701,3 +701,62 @@ def test_graceful_shutdown_completes_inflight():
     body = result["body"]
     assert body["choices"][0]["finish_reason"] == "stop"  # 完整响应，未被停机截断
     assert body["usage"]["completion_tokens"] == body["usage"]["prompt_tokens"]
+
+
+# ---- 并发 + 三不变量压力测试（第 12 步；不变量编号见 docs/protocol.md） ----
+
+
+def test_concurrent_mixed_requests():
+    """并发 × HTTP 层：8 个请求并发在途（奇数流式、偶数非流式，max_tokens
+    各异 → 完成顺序乱序），echo 语义下每个响应的 content 恰为自己 prompt 的
+    前缀——按 uid 分发不串流（不变量 2 的端到端形态）；全部答完登记表排空。"""
+    app = create_app()
+    with _live_server(app) as (port, _server):
+        engine = app.state.engine
+        results: dict = {}
+
+        def expected_content(k: int, max_tokens: int) -> str:
+            msgs = [{"role": "user", "content": " ".join(f"字{k * 100 + i}" for i in range(30))}]
+            return tk.decode(ct.encode(msgs, enable_thinking=False)[:max_tokens])
+
+        def request_k(k: int, stream: bool, max_tokens: int) -> None:
+            payload = {
+                "model": SERVED_MODEL_ID,
+                "messages": [{"role": "user", "content": " ".join(f"字{k * 100 + i}" for i in range(30))}],
+                "max_tokens": max_tokens,
+                "enable_thinking": False,
+                "stream": stream,
+            }
+            # trust_env=False：环境代理会劫持回环请求（见断开测试）
+            with httpx.Client(timeout=30, trust_env=False) as hc:
+                url = f"http://127.0.0.1:{port}/v1/chat/completions"
+                if not stream:
+                    r = hc.post(url, json=payload)
+                    results[k] = r.json()["choices"][0]["message"]["content"]
+                    return
+                parts = []
+                with hc.stream("POST", url, json=payload) as r:
+                    for ln in r.iter_lines():
+                        if not ln.startswith("data: "):
+                            continue
+                        data = ln[len("data: ") :]
+                        if data == "[DONE]":
+                            break
+                        parts.append(json.loads(data)["choices"][0]["delta"].get("content", ""))
+                results[k] = "".join(parts)
+
+        # 30 个"字"词 ≈ 148 token 的 prompt，max_tokens 60/65/70/75 均截断 →
+        # finish_reason=length 确定，完成时间错开（60~75 × 20ms）
+        threads = [
+            threading.Thread(target=request_k, args=(k, k % 2 == 1, 60 + 5 * (k % 4)))
+            for k in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads)
+        assert len(results) == 8  # 全部拿到响应
+        for k, content in results.items():
+            assert content == expected_content(k, 60 + 5 * (k % 4)), f"请求 {k} 串流或截断"
+        _wait_uids_gone(engine)
