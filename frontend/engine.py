@@ -6,8 +6,8 @@ submit() 一个 UserMsg，拿到该 uid 专属的 asyncio.Queue 消费 token 流
 
 后端崩溃（stdout EOF，协议的致命错误表达）以 EngineEOF 哨兵投入所有
 在途 queue，消费方不至于挂死。abort 能力本类已具备（abort→AbortBackendMsg，
-后端按 next_token=-1 收尾行结束）；API 层流式/非流式断开均已接（第 11 步），
-各结束方式的除名核对与 ExitMsg 停机在途核对属第 11 步余下部分。
+后端按 next_token=-1 收尾行结束）；四种结束方式的除名与停机在途核对均有
+测试锁死（第 11 步）。
 """
 
 import asyncio

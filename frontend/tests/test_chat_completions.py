@@ -528,10 +528,10 @@ def test_stream_engine_crash_truncates():
 
 @contextlib.contextmanager
 def _live_server(app):
-    """真起 uvicorn，yield 端口号。断开语义只能真服务器才有：TestClient 在
-    ASGI 层直接调 app，TCP 断开不会产生 http.disconnect。自绑 port=0 socket
-    交给 server.run(sockets=)——0.54 的 Server 没暴露 sockets 属性，端口我们
-    说了算。"""
+    """真起 uvicorn，yield (port, server)——server 供测试下令停机（should_exit）。
+    断开语义只能真服务器才有：TestClient 在 ASGI 层直接调 app，TCP 断开不会
+    产生 http.disconnect。自绑 port=0 socket 交给 server.run(sockets=)——
+    0.54 的 Server 没暴露 sockets 属性，端口我们说了算。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     sock.listen(socket.SOMAXCONN)
@@ -544,7 +544,7 @@ def _live_server(app):
         time.sleep(0.01)
     assert server.started, "uvicorn 未启动完成"
     try:
-        yield port
+        yield port, server
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -563,9 +563,11 @@ def test_stream_client_disconnect_aborts():
     """客户端断开（第 11 步·流式侧）：半途关流 → 生成器收到取消 → 发 abort
     → 假后端立即收尾（next_token=-1 约定）→ uid 从登记表除名。"""
     app = create_app()
-    with _live_server(app) as port:
+    with _live_server(app) as (port, _server):
         long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}]
-        with httpx.Client(timeout=10) as hc:
+        # trust_env=False：环境代理变量会把回环请求劫持去转发（502 Bad Gateway
+        # 即代理回的），测试对自绑端口必须直连
+        with httpx.Client(timeout=10, trust_env=False) as hc:
             with hc.stream(
                 "POST",
                 f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -595,7 +597,7 @@ def test_nonstream_client_disconnect_aborts():
     的 stream() 会卡在读头，断开只能在 socket 层制造。
     """
     app = create_app()
-    with _live_server(app) as port:
+    with _live_server(app) as (port, _server):
         body = json.dumps(
             {
                 "model": SERVED_MODEL_ID,
@@ -621,3 +623,81 @@ def test_nonstream_client_disconnect_aborts():
         assert engine._queues, "生成未在途（请求没走到 submit）"
         sock.close()  # 算到一半，弃连
         _wait_uids_gone(engine)
+
+
+def test_all_endings_deregister():
+    """四种结束方式的除名核对（第 11 步收尾）：finished / ErrorMsg 结束即从
+    登记表除名；EngineEOF 崩溃清空整个登记表。abort 路径已由两个断开测试
+    锁定（顺带验证了队列无人消费也除名），不在此重复。"""
+    app = create_app()
+    with TestClient(app) as client:
+        engine = app.state.engine
+
+        # 1) finished：正常收尾行
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": SERVED_MODEL_ID, "messages": MESSAGES, "max_tokens": 16},
+        )
+        assert r.status_code == 200
+        assert not engine._queues
+
+        # 2) ErrorMsg：单请求失败
+        long_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(4000))}]
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": SERVED_MODEL_ID, "messages": long_messages, "max_tokens": 8},
+        )
+        assert r.status_code == 400
+        assert not engine._queues
+
+        # 3) EngineEOF：崩溃哨兵清空登记表（放最后——后端进程已死）
+        inflight_messages = [{"role": "user", "content": " ".join(f"字{i}" for i in range(800))}]
+        threading.Timer(0.3, engine._proc.kill).start()
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": SERVED_MODEL_ID, "messages": inflight_messages, "max_tokens": 4096},
+        )
+        assert r.status_code == 503
+        assert not engine._queues
+
+
+def test_graceful_shutdown_completes_inflight():
+    """ExitMsg 停机在途核对（第 11 步收尾，HTTP 层）：uvicorn 优雅停机先等
+    在途请求答完（h11 对在途连接只标 close-after-response），之后才跑
+    lifespan 的 engine.stop（ExitMsg）。判据：在途时下令停机，请求仍完整
+    响应、后端排空后退出码 0、登记表清空。
+
+    引擎层的 ExitMsg 排干协议语义由 test_engine.py test_stop_drains_inflight
+    锁定，本测试锁 HTTP 层的停机时序。"""
+    app = create_app()
+    with _live_server(app) as (port, server):
+        engine = app.state.engine
+        payload = {
+            "model": SERVED_MODEL_ID,
+            # ~148 token ≈ 3s：够在途时下令停机，也不拖慢测试
+            "messages": [{"role": "user", "content": " ".join(f"字{i}" for i in range(30))}],
+            "max_tokens": 4096,
+        }
+        result: dict = {}
+
+        def do_request() -> None:
+            # trust_env=False：见 test_stream_client_disconnect_aborts，回环直连
+            with httpx.Client(timeout=15, trust_env=False) as hc:
+                result["body"] = hc.post(
+                    f"http://127.0.0.1:{port}/v1/chat/completions", json=payload
+                ).json()
+
+        thread = threading.Thread(target=do_request)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while not engine._queues and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert engine._queues, "生成未在途（请求没走到 submit）"
+        server.should_exit = True  # 在途时停机：等它答完再收摊
+        thread.join(timeout=15)
+    # 出了 with 块：server 线程已 join，lifespan 的 engine.stop 已跑完
+    assert engine._proc.returncode == 0  # ExitMsg 干净退场，没走到击杀兜底
+    assert not engine._queues
+    body = result["body"]
+    assert body["choices"][0]["finish_reason"] == "stop"  # 完整响应，未被停机截断
+    assert body["usage"]["completion_tokens"] == body["usage"]["prompt_tokens"]

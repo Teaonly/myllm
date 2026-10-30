@@ -108,6 +108,7 @@ def test_stop_drains_inflight():
         q = await ep.submit(UserMsg(uid=ep.alloc_uid(), input_ids=[5, 6, 7]))
         await ep.stop()
         assert ep._proc.returncode == 0
+        assert not ep._queues  # 排空收尾：在途 uid 也按不变量 1 结束并除名
         msgs = await _collect(q)
         assert [m.next_token for m in msgs] == [5, 6, 7]
 
@@ -125,5 +126,6 @@ def test_crash_eof_sentinel():
         ep._proc.kill()  # 模拟 OOM / 崩溃
         msgs = await _collect(q)
         assert isinstance(msgs[-1], EngineEOF)
+        assert not ep._queues  # EOF 收摊：登记表整体清空
 
     run(scenario())
