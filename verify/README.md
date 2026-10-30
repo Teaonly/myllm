@@ -17,7 +17,8 @@
 架构**完全不动**（48 层、512 专家、vocab 248320、hidden 2560、hc_count=4、
 PLE、indexer 全保留），但每个组件（embed、48 个 decoder 层、hyper_connection_mixer、
 lm_head）都是：**固定种子物化到 GPU → 前向捕获 → 丢弃**。峰值显存约 12GB
-（MoE 层 fp32 权重 ~10GB），64GB 显卡足够。fp32 参考计算。
+（MoE 层 fp32 权重 ~10GB），64GB 显卡足够。计算保持 fp32 参考，**落盘浮点
+张量一律 bf16**（全量约 2.0GB，原来 fp32 落盘约 3.9GB）。
 
 ### 唯一例外：PLE n-gram 嵌入
 
@@ -45,17 +46,25 @@ N(0, initializer_range) 初始化等价。引擎侧用同一公式即可复现�
   全部 cache 状态（线性层 conv/recurrent、indexed 层 KV 与 indexer_keys）
 - `cache_states.safetensors` — 最终 cache 快照
 - `manifest.json` — 种子方案与文件清单
+- `index.json` — **详细结果映射**（~1.7MB）：每个 tensor key → 所在文件、
+  shape、dtype、numel/bytes、所属组件（component）与子模块（submodule）及
+  其类名、slot（`in[i]`/`in[kwarg]`/`out`/`cos`/cache 属性…）、方向
+  （input/output/state）；另含 key 命名方案说明、每个文件的张量数/磁盘
+  大小/sha256、总量统计
 
-大张量约定：>8M 元素的存 bf16（如整条 logits），其余全 fp32；key 中
-`out_last_fp32` 是最后一个位置的完整 fp32 logits。
+精度约定：**计算全程 fp32，落盘浮点张量一律 bf16**（磁盘约减半）；整数/bool
+张量（token ids、ngram 状态、mask 等）原样保存不受影响。唯一 fp32 例外：
+`<phase>/lm_head/out_last_fp32`（最后一个位置的完整 fp32 logits，约 1MB，
+用作精确 argmax 锚点；实测与 bf16 版最大差 ~0.008，即 bf16 舍入量级）。
 
 ### 对拍
 
 ```python
 from safetensors.torch import load_file
 gold = load_file("full_out/prefill.safetensors")
-# 引擎逐层算完后：
-# torch.testing.assert_close(y, gold["prefill/model.layers.17/out"], rtol=1e-5, atol=1e-5)
+# 引擎逐层算完后（golden 是 fp32 计算后量化到 bf16 的，容差需按 bf16 级别）：
+# torch.testing.assert_close(y.float(), gold["prefill/model.layers.17/out"].float(), rtol=1e-2, atol=1e-2)
+# 需要更严的数值锚点时用 <phase>/lm_head/out_last_fp32（fp32，可精确核对 argmax/top-k）
 ```
 
 增量解码对拍用 `decodeNN`（每步的输入 token、每层输入 hidden、cache 状态序列）。

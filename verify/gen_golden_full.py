@@ -11,9 +11,18 @@ single GPU even alone): its rows are generated on demand from a per-row seed
 (see LazyNGramRows below), which is deterministic and reproducible on any
 machine, including your inference engine.
 
-Reference dtype: fp32. Reference implementation: standard Transformers
-(local main checkout), driven module-by-module exactly like
-Qwen4ExpTextModel.forward / Qwen4ExpForCausalLM.forward.
+Computation dtype: fp32 (reference quality). STORAGE dtype: bf16 -- every
+floating-point tensor is cast to bf16 when dumped (halves disk usage; compare
+with bf16-level tolerances), integer/bool tensors are stored unchanged.
+Sole fp32 exception: <phase>/lm_head/out_last_fp32 (exact-argmax anchor).
+
+Reference implementation: standard Transformers (local main checkout), driven
+module-by-module exactly like Qwen4ExpTextModel.forward / Qwen4ExpForCausalLM.forward.
+
+Alongside the safetensors, writes index.json: a detailed mapping of every
+dumped tensor key -> file, shape, dtype, size, component/submodule (with class
+names), slot and direction, plus per-file stats (tensor count, disk size,
+sha256).
 
 Usage:
   venv/bin/python gen_golden_full.py [--decode-steps 4] [--prefill-only] ...
@@ -23,6 +32,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -51,19 +61,21 @@ SEED_BASE = 20240917
 INIT_RANGE = 0.02  # tc.initializer_range of the real config
 
 
-def tensorize(obj, prefix, out, max_elems_fp32=8_000_000):
+def stow(t: torch.Tensor) -> torch.Tensor:
+    """Storage cast: floats -> bf16 (halves disk), ints/bools kept bit-exact."""
+    t = t.detach()
+    return t.to(torch.bfloat16) if t.is_floating_point() else t
+
+
+def tensorize(obj, prefix, out):
     if isinstance(obj, torch.Tensor):
-        t = obj.detach()
-        if t.numel() > max_elems_fp32:  # keep huge tensors comparable: bf16 copy
-            out[prefix] = t.detach().to(torch.bfloat16).cpu()
-        else:
-            out[prefix] = t.detach().float().cpu()
+        out[prefix] = stow(obj).cpu()
     elif isinstance(obj, (tuple, list)):
         for i, v in enumerate(obj):
             tensorize(v, f"{prefix}[{i}]", out)
 
 
-def capture(comp, prefix_root, store):
+def capture(comp, prefix_root, store, classes):
     handles = []
 
     def make_hook(name):
@@ -77,7 +89,10 @@ def capture(comp, prefix_root, store):
             store.update({f"{prefix_root}/{k}": v for k, v in data.items()})
         return hook
 
+    # classes: phase-independent module path -> class name, for index.json
+    root = prefix_root.partition("/")[2]
     for name, mod in comp.named_modules():
+        classes[f"{root}/{name}".rstrip("/")] = type(mod).__name__
         if name:
             handles.append(mod.register_forward_hook(make_hook(name), with_kwargs=True))
     return handles
@@ -136,14 +151,80 @@ def dump_cache(cache: DynamicCache, prefix: str, out: dict):
     for i, layer in enumerate(cache.layers):
         for attr, val in vars(layer).items():
             if isinstance(val, torch.Tensor):
-                out[f"{prefix}/layer{i}/{attr}"] = val.detach().float().cpu()
+                out[f"{prefix}/layer{i}/{attr}"] = stow(val).cpu()
             elif isinstance(val, list) and val and isinstance(val[0], torch.Tensor):
                 for j, t in enumerate(val):
-                    out[f"{prefix}/layer{i}/{attr}[{j}]"] = t.detach().float().cpu()
+                    out[f"{prefix}/layer{i}/{attr}[{j}]"] = stow(t).cpu()
             elif isinstance(val, dict) and val and any(isinstance(v, torch.Tensor) for v in val.values()):
                 for k, t in val.items():
                     if isinstance(t, torch.Tensor):
-                        out[f"{prefix}/layer{i}/{attr}[{k}]"] = t.detach().float().cpu()
+                        out[f"{prefix}/layer{i}/{attr}[{k}]"] = stow(t).cpu()
+
+
+# ---------------------------------------------------------------------------
+# index.json helpers: parse a golden key into its structural parts.
+#   <phase>/<component>[/<submodule>]/<slot>
+# ---------------------------------------------------------------------------
+SLOT_RE = re.compile(
+    r"^(?P<mod>.+)/(?P<slot>in\[[^\]]+\]|in|out_full_bf16|out_last_fp32|out\[[^\]]+\]|out|next_token|cos|sin)$"
+)
+CACHE_RE = re.compile(r"^(?:cache/)?layer(?P<idx>\d+)/(?P<attr>.+)$")
+
+
+def describe_key(key: str, classes: dict) -> dict:
+    phase, _, rest = key.partition("/")
+    component = submodule = module_class = slot = None
+    direction = None
+    if not rest:  # bare key, e.g. "input_ids"
+        component = phase
+    elif rest == "next_token":
+        slot, direction = "next_token", "output"
+    elif phase == "final_cache" or rest.startswith("cache/"):
+        m = CACHE_RE.match(rest[len("cache/"):] if rest.startswith("cache/") else rest)
+        if m:
+            component = f"cache.layer{m.group('idx')}"
+            slot = m.group("attr")
+            direction = "state"
+            module_class = classes.get(component)
+    else:
+        m = SLOT_RE.match(rest)
+        if m:
+            mod, slot = m.group("mod"), m.group("slot")
+        else:
+            mod = rest
+        component, _, sub = mod.partition("/")
+        submodule = sub or None
+        module_class = classes.get(mod)
+        if slot is not None:
+            direction = "input" if slot == "in" or slot.startswith("in[") else "output"
+    return {
+        "phase": phase,
+        "component": component,
+        "submodule": submodule,
+        "module_class": module_class,
+        "slot": slot,
+        "direction": direction,
+    }
+
+
+def index_entry(key: str, tensor: torch.Tensor, fname: str, classes: dict) -> dict:
+    e = describe_key(key, classes)
+    e.update(
+        file=fname,
+        shape=list(tensor.shape),
+        dtype=str(tensor.dtype).removeprefix("torch."),
+        numel=tensor.numel(),
+        bytes=tensor.numel() * tensor.element_size(),
+    )
+    return e
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main():
@@ -177,10 +258,37 @@ def main():
     # real-device rotary (cheap, deterministic; never materialized from meta)
     rotary = Qwen4ExpTextRotaryEmbedding(config=tc).to(dev)
 
+    # module path -> class name, and the detailed result-index skeleton
+    classes = {"rotary": type(rotary).__name__, "lm_head": type(model.lm_head).__name__}
+    golden_index = {
+        "generated_by": "gen_golden_full.py",
+        "storage_note": (
+            "All float tensors are computed in fp32 but STORED in bf16 (halves disk; "
+            "use bf16-level tolerances when comparing, e.g. rtol/atol ~ 1e-2/1e-2). "
+            "Integer/bool tensors are stored unchanged. Sole fp32 exception: "
+            "<phase>/lm_head/out_last_fp32 (exact-argmax anchor)."
+        ),
+        "key_scheme": (
+            "<phase>/<component>[/<submodule>]/<slot> -- "
+            "phase: prefill | decodeNN | final_cache; "
+            "component: model.embed_tokens | model.layers.N | model.hyper_connection_mixer | "
+            "lm_head | rotary | cache.layerN; "
+            "slot: in[i] (positional arg i) | in[kwarg] | out | out[j] | cos | sin | "
+            "next_token | out_full_bf16 | out_last_fp32 | <cache_attr>"
+        ),
+        "files": {},
+        "tensors": {},
+    }
+
+    def index_tensors(store, fname):
+        for k, v in store.items():
+            golden_index["tensors"][k] = index_entry(k, v, fname, classes)
+
     # fixed input
     g = torch.Generator().manual_seed(args.seed_input)
     input_ids = torch.randint(0, tc.vocab_size, (1, args.prefill_len), generator=g).to(dev)
     torch.save(input_ids.cpu(), os.path.join(args.out_dir, "input_ids.pt"))
+    index_tensors({"input_ids": input_ids.cpu()}, "input_ids.pt")
 
     def component_seed(name: str, idx: int | None = None):
         # stable across processes (builtin hash() is randomized!)
@@ -201,6 +309,7 @@ def main():
             "randn(dim, Generator(lazy_seed_base ^ r)) * initializer_range."
         ),
         },
+        "storage_dtype": "bfloat16 (floats; computation stays fp32), ints/bools unchanged",
         "ple_layer_idx": ple_layer_idx,
         "prefill_len": args.prefill_len,
         "decode_steps": args.decode_steps,
@@ -217,12 +326,12 @@ def main():
         B, L = tok_ids.shape
 
         materialize(text.embed_tokens, component_seed("embed"), init_fn, dev)
-        h_embed = capture(text.embed_tokens, f"{prefix}/model.embed_tokens", store) if capture_submodules else []
+        h_embed = capture(text.embed_tokens, f"{prefix}/model.embed_tokens", store, classes) if capture_submodules else []
         with torch.no_grad():
             inputs_embeds = text.embed_tokens(tok_ids)
         for h in h_embed:
             h.remove()
-        store[f"{prefix}/model.embed_tokens/out"] = inputs_embeds.float().cpu()
+        store[f"{prefix}/model.embed_tokens/out"] = stow(inputs_embeds).cpu()
 
         ple_input_ids = tok_ids
         past_seen = cache.get_seq_length() if cache is not None else 0
@@ -252,13 +361,13 @@ def main():
         conv_mask = causal_mask_mapping["linear_attention"]
 
         position_embeddings = rotary(inputs_embeds, pos3)
-        store[f"{prefix}/rotary/cos"] = position_embeddings[0].float().cpu()
-        store[f"{prefix}/rotary/sin"] = position_embeddings[1].float().cpu()
+        store[f"{prefix}/rotary/cos"] = stow(position_embeddings[0]).cpu()
+        store[f"{prefix}/rotary/sin"] = stow(position_embeddings[1]).cpu()
 
         hidden = inputs_embeds.repeat(1, 1, tc.hc_count)
         for i, layer in enumerate(text.layers[: tc.num_hidden_layers]):
             materialize(layer, component_seed("layer", i), init_fn, dev)
-            hs = capture(layer, f"{prefix}/model.layers.{i}", store) if capture_submodules else []
+            hs = capture(layer, f"{prefix}/model.layers.{i}", store, classes) if capture_submodules else []
             with torch.no_grad():
                 out = layer(
                     hidden,
@@ -271,11 +380,11 @@ def main():
             for h in hs:
                 h.remove()
             hidden = out[0] if isinstance(out, tuple) else out
-            store[f"{prefix}/model.layers.{i}/out"] = hidden.float().cpu()
+            store[f"{prefix}/model.layers.{i}/out"] = stow(hidden).cpu()
             free(layer)
 
         materialize(text.hyper_connection_mixer, component_seed("mixer"), init_fn, dev)
-        hs = capture(text.hyper_connection_mixer, f"{prefix}/model.hyper_connection_mixer", store) if capture_submodules else []
+        hs = capture(text.hyper_connection_mixer, f"{prefix}/model.hyper_connection_mixer", store, classes) if capture_submodules else []
         with torch.no_grad():
             hidden = text.hyper_connection_mixer(hidden)
         for h in hs:
@@ -287,17 +396,20 @@ def main():
         lm.weight = text.embed_tokens.weight  # tie
         with torch.no_grad():
             logits = lm(hidden)
-        store[f"{prefix}/lm_head/in"] = hidden.float().cpu()
-        store[f"{prefix}/lm_head/out_full_bf16"] = logits.detach().to(torch.bfloat16).cpu()
-        store[f"{prefix}/lm_head/out_last_fp32"] = logits[:, -1].float().cpu()
+        store[f"{prefix}/lm_head/in"] = stow(hidden).cpu()
+        store[f"{prefix}/lm_head/out_full_bf16"] = stow(logits).cpu()
+        store[f"{prefix}/lm_head/out_last_fp32"] = logits[:, -1].float().cpu()  # tiny fp32 anchor
         free(text.embed_tokens)
         return store, hidden, logits
 
     # ---- prefill ----
     cache = DynamicCache(config=tc)
+    for i, l in enumerate(cache.layers):
+        classes[f"cache.layer{i}"] = type(l).__name__
     store, hidden, logits = run_pass(input_ids, cache, "prefill")
     save_file(store, os.path.join(args.out_dir, "prefill.safetensors"))
     manifest["files"]["prefill.safetensors"] = len(store)
+    index_tensors(store, "prefill.safetensors")
     print(f"[prefill] logits {tuple(logits.shape)} tensors={len(store)}", flush=True)
 
     # ---- decode ----
@@ -308,6 +420,7 @@ def main():
         dump_cache(cache, f"decode{step:02d}/cache", store)
         save_file(store, os.path.join(args.out_dir, f"decode{step:02d}.safetensors"))
         manifest["files"][f"decode{step:02d}.safetensors"] = len(store)
+        index_tensors(store, f"decode{step:02d}.safetensors")
         next_tok = logits[:, -1].argmax(-1, keepdim=True)
         print(f"[decode {step}] tensors={len(store)}", flush=True)
 
@@ -315,9 +428,42 @@ def main():
     dump_cache(cache, "final_cache", final_cache)
     save_file(final_cache, os.path.join(args.out_dir, "cache_states.safetensors"))
     manifest["files"]["cache_states.safetensors"] = len(final_cache)
+    index_tensors(final_cache, "cache_states.safetensors")
 
     with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+
+    # ---- index.json: detailed result mapping ----
+    phase_desc = {
+        "input": f"fixed input token ids, torch.randint seed={args.seed_input} (torch.save format)",
+        "prefill": f"full prefill pass (seq_len={args.prefill_len}); every component AND submodule input/output captured",
+        "final_cache": f"full cache state after all {args.decode_steps} decode steps",
+    }
+    file_meta = [("input_ids.pt", "input")] + [
+        (fname, "final_cache" if fname.startswith("cache_states") else fname.split(".")[0])
+        for fname in manifest["files"]
+    ]
+    for fname, phase in file_meta:
+        desc = phase_desc.get(phase) or (
+            f"decode step {phase[-2:]}: single token, component-level I/O only, "
+            f"plus full cache snapshot after the step"
+        )
+        golden_index["files"][fname] = {
+            "phase": phase,
+            "description": desc,
+            "tensors": manifest["files"].get(fname, 1),
+            "disk_bytes": os.path.getsize(os.path.join(args.out_dir, fname)),
+            "sha256": sha256_file(os.path.join(args.out_dir, fname)),
+        }
+    golden_index["summary"] = {
+        "total_tensors": len(golden_index["tensors"]),
+        "total_tensor_bytes": sum(e["bytes"] for e in golden_index["tensors"].values()),
+        "total_disk_bytes": sum(f["disk_bytes"] for f in golden_index["files"].values()),
+    }
+    with open(os.path.join(args.out_dir, "index.json"), "w") as f:
+        json.dump(golden_index, f, indent=2)
+    print(f"[index] {golden_index['summary']['total_tensors']} tensors, "
+          f"{golden_index['summary']['total_disk_bytes'] / 1e9:.2f} GB on disk", flush=True)
     print("done", flush=True)
 
 
