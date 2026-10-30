@@ -45,6 +45,7 @@ from fastapi import APIRouter, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .engine import EngineEOF, EngineProcess
 from .messages import DetokenizeMsg, ErrorMsg, SamplingParams, UserMsg
@@ -96,6 +97,14 @@ async def openai_validation_error(request: Request, exc: RequestValidationError)
         for e in exc.errors()
     )
     return _error(400, f"Invalid request: {details}")
+
+
+async def openai_http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Starlette/FastAPI 的 HTTPException（当前唯一来源：鉴权 401）→ OpenAI
+    错误体，401 带官方的 code=invalid_api_key。本仓当前只有 OpenAI 一个
+    API 方言；Anthropic 端点将来落地时再分方言处理。"""
+    code = "invalid_api_key" if exc.status_code == 401 else None
+    return _error(exc.status_code, str(exc.detail), code=code)
 
 
 class StreamOptions(BaseModel):

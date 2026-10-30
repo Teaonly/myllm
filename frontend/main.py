@@ -2,13 +2,19 @@
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .auth import load_api_keys_from_env, make_auth_dependency
 from .chat_template import ChatTemplate
 from .engine import EngineProcess
 from .log import setup_logging
-from .openai_api import openai_validation_error, router as openai_router
+from .openai_api import (
+    openai_http_exception,
+    openai_validation_error,
+    router as openai_router,
+)
 from .tokenizer import Tokenizer
 
 
@@ -31,23 +37,27 @@ async def lifespan(app: FastAPI):
         await engine.stop()
 
 
-def create_app() -> FastAPI:
+def create_app(api_keys: list[str] | None = None) -> FastAPI:
+    """api_keys 非空 → /v1/* 挂 Bearer 鉴权（auth 模块）；None → 不设防。"""
     setup_logging()
     app = FastAPI(title="myllm", lifespan=lifespan)
 
-    app.include_router(openai_router)
+    dependencies = [Depends(make_auth_dependency(api_keys))] if api_keys else []
+    app.include_router(openai_router, dependencies=dependencies)
     # pydantic/FastAPI 原生的 422 detail 体也统一成 OpenAI 错误体（见该函数）
     app.add_exception_handler(RequestValidationError, openai_validation_error)
+    # HTTPException（当前唯一来源：鉴权 401）同样翻译成 OpenAI 错误体
+    app.add_exception_handler(StarletteHTTPException, openai_http_exception)
 
     @app.get("/health")
     def health() -> dict:
-        """存活探针：进程在、HTTP 循环活着。"""
+        """存活探针：进程在、HTTP 循环活着。不设防（探针不该要 key）。"""
         return {"status": "ok"}
 
     return app
 
 
-app = create_app()
+app = create_app(api_keys=load_api_keys_from_env())
 
 
 if __name__ == "__main__":
