@@ -69,6 +69,23 @@ gold = load_file("full_out/prefill.safetensors")
 
 增量解码对拍用 `decodeNN`（每步的输入 token、每层输入 hidden、cache 状态序列）。
 
+### 教学版纯手写前向（verify_forward.py）
+
+单文件、只用最基础 PyTorch 操作（matmul/softmax/索引/逐元素）的完整推理实现，
+风格向 llama2.c / picoGPT 看齐：按前向顺序线性展开、注释讲清每一步。
+权重不落盘，按上面的种子方案**逐层物化 → 前向 → 丢弃**（峰值显存 ~12GB，
+必须 `--device cuda`，CPU 随机数流不同无法复现权重）；95GiB 的 PLE n-gram
+表按行懒生成。对拍范围：prefill 逐层逐子模块，decode 逐层输出 + 全部 cache
+状态 + next_token（decode 的 golden 未保存子模块明细，自动跳过）。
+
+```bash
+./.venv/bin/python verify_forward.py --layers 4   # 快速冒烟（~30s）
+./.venv/bin/python verify_forward.py --deep       # 完整 48 层 + 4 步 decode + 子模块入口（~1min）
+```
+
+实测 1215/1215 项通过（rtol=atol=1e-2，整数/bool 精确相等；
+`lm_head/out_last_fp32` 锚点 err≈5e-06，next_token 四步全对）。
+
 ### 已知边界
 
 - MTP 层（`mtp.*`，1 层 full_attention + fc_embedding）在文本 ForCausalLM 中被
