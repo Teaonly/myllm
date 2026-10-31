@@ -73,6 +73,9 @@ gold = load_file("full_out/prefill.safetensors")
 
 单文件、只用最基础 PyTorch 操作（matmul/softmax/索引/逐元素）的完整推理实现，
 风格向 llama2.c / picoGPT 看齐：按前向顺序线性展开、注释讲清每一步。
+文件按 §1 配置 → §2 基础算子 → §3 前向主体（组件按数据流顺序）→ §4 权重再生
+（第一遍可跳过）→ §5 对拍 → §6 主流程 分节，文件头有阅读指南和整体数据流图，
+适合打印后从上往下读。
 权重不落盘，按上面的种子方案**逐层物化 → 前向 → 丢弃**（峰值显存 ~12GB，
 必须 `--device cuda`，CPU 随机数流不同无法复现权重）；95GiB 的 PLE n-gram
 表按行懒生成。对拍范围：prefill 逐层逐子模块，decode 逐层输出 + 全部 cache
