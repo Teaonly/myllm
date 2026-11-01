@@ -113,6 +113,8 @@ ErrorMsg 是该 uid 的最后一行；其余在途请求不受影响。
                                              进程退出，stdout 关闭
 ```
 
+ExitMsg 之后到达的 UserMsg：以 ErrorMsg 拒绝（引擎退出中）。
+
 ### 7. 致命错误
 
 后端崩溃 / OOM：不承诺任何收尾行，stdout 关闭（EOF）即信号；细节在 stderr 日志里。
