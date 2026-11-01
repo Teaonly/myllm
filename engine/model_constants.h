@@ -190,7 +190,8 @@ constexpr bool MTP_DEDICATED_EMBED = false;  // 与主干共享 embed/lm_head(co
 // ---------------------------------------------------------------------------
 //
 // 这些不是 config 里的新自由度,而是上面常量的确定性推导。按"一路序列"计
-// (引擎固定两路:主任务 + btw,双流是引擎常量,在数据结构那一步定,不在此)。
+// (引擎固定两路对等双流——无主次、无优先级,是引擎常量;语义与布局定案见
+//  docs/cache.md)。
 
 // GDN 递归状态 S:每层一个 (V_HEADS, V_DIM, K_DIM) = 48×128×128 的 FP32 矩阵组。
 constexpr int GDN_S_ELEMS = V_HEADS * V_DIM * K_DIM;          // 786'432

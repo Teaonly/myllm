@@ -6,7 +6,7 @@
 
 ## 职责
 
-- **前端（HTTP API）**：面向客户端的 HTTP 服务，负责请求解析、tokenize / detokenize、会话与并发管理、流式输出（SSE / chunked）；不碰 GPU。
+- **前端（HTTP API）**：面向客户端的 HTTP 服务，负责请求解析、tokenize / detokenize、会话组装（多轮历史全量并入 input_ids）、API 方言与流式输出（SSE / chunked）；不碰 GPU，也不做并发准入——它不知道缓存的存在，一切容量问题通过 ErrorMsg 感知（[cache.md](cache.md) §5）。
 - **后端（GPU 推理进程）**：加载模型，专注 prefill/decode 计算；不做网络 IO。**不用 Python 开发**，仓库内所有 Python 代码只存在于 frontend/；协议（[protocol.md](protocol.md)）是两侧唯一的共享契约，各自语言实现编解码。
 - **交互**：前端把请求写进后端的 stdin，后端逐 token 写回 stdout。两个独立进程，边界即模块边界。
 
@@ -18,7 +18,7 @@
 
 ## 协议
 
-交互契约（消息、时序、不变量）见 [protocol.md](protocol.md)。要点：NDJSON 文本，不使用 msgpack / pickle / 任何二进制序列化；stdout 只放协议数据；引擎进程常驻（模型加载是分钟级），并发由前端排队。
+交互契约（消息、时序、不变量）见 [protocol.md](protocol.md)。要点：NDJSON 文本，不使用 msgpack / pickle / 任何二进制序列化；stdout 只放协议数据；引擎进程常驻（模型加载是分钟级）。并发由后端准入：对等双流（[cache.md](cache.md)），满载即拒（`ErrorMsg code=busy`），重试交给客户端 SDK——后端不排队，前端不排队。
 
 ## 前端技术选型（2026-10）
 

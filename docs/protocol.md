@@ -34,7 +34,9 @@
 |---|---|---|
 | `DetokenizeMsg` | uid, next_token, finished | 每生成一个 token 一行；finished=true 为该请求最后一行 |
 | `BatchTokenizerMsg` | data: [msg, ...] | 打包 DetokenizeMsg |
-| `ErrorMsg` | uid, message | 单请求失败；致命错误以进程退出表达 |
+| `ErrorMsg` | uid, code?, message | 单请求失败；致命错误以进程退出表达 |
+
+`ErrorMsg.code`（可选，机器可读）：`busy`＝双流满载或目标流在途（瞬态，客户端可重试）；`context_length_exceeded`＝input_ids 超过引擎上下文容量（永久）。缺省＝未分类错误。准入规则见 [cache.md](cache.md) §5/§7。
 
 ## 交互时序
 
@@ -52,7 +54,7 @@
   < DetokenizeMsg{uid=1, next_token=eos, finished=true}
 ```
 
-finished=true 的触发：命中 EOS（未开 ignore_eos）或达到 max_tokens。
+finished=true 的触发：命中 EOS（未开 ignore_eos）、达到 max_tokens，或达到引擎上下文容量上限 ctx_cap（缓存写满，强制收尾——已生成 token 全部有效，语义同 max_tokens，见 [cache.md](cache.md) §7）。
 
 ### 2. 并发请求
 
@@ -69,6 +71,8 @@ finished=true 的触发：命中 EOS（未开 ignore_eos）或达到 max_tokens�
 
 完成顺序与提交顺序无关，接收方不得假设先提交先完成。
 
+并发上限为 2（对等双流，见 [cache.md](cache.md) §1）；双流均在途时的新请求按 §5 满载拒绝处理。
+
 ### 3. 中止
 
 ```
@@ -84,12 +88,23 @@ finished=true 的触发：命中 EOS（未开 ignore_eos）或达到 max_tokens�
 
 ```
   > UserMsg{uid=1, 超长 input_ids}
-  < ErrorMsg{uid=1, message="context length exceeded"}
+  < ErrorMsg{uid=1, code="context_length_exceeded", message="input_ids exceeds ctx_cap"}
 ```
 
 ErrorMsg 是该 uid 的最后一行；其余在途请求不受影响。
 
-### 5. 优雅退出
+### 5. 满载拒绝
+
+```
+  > UserMsg{uid=1, ...}                          ← 双流均在途
+  > UserMsg{uid=2, ...}
+  > UserMsg{uid=3, ...}
+  < ErrorMsg{uid=3, code="busy", message="both streams in flight (2/2)"}
+```
+
+后端不排队：双流满载、或目标流（LCP 亲和槽）在途时，新请求立即以 ErrorMsg(code=busy) 拒绝。瞬态错误，重试由客户端承担（两方言 SDK 对 503/529 默认自动退避重试）。同对话的跟进请求同样吃 busy——亲和优先于即时可用性，理由见 [cache.md](cache.md) §5。
+
+### 6. 优雅退出
 
 ```
   > ExitMsg
@@ -98,7 +113,7 @@ ErrorMsg 是该 uid 的最后一行；其余在途请求不受影响。
                                              进程退出，stdout 关闭
 ```
 
-### 6. 致命错误
+### 7. 致命错误
 
 后端崩溃 / OOM：不承诺任何收尾行，stdout 关闭（EOF）即信号；细节在 stderr 日志里。
 
