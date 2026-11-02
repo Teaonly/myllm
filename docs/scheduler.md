@@ -85,7 +85,7 @@ loop:
 
 ```text
               UserMsg 准入（本流 IDLE；准入规则 cache.md §5）
-  ┌──────┐    match → extend / rebuild / 全命中退化（cache.md §6）   ┌─────────┐
+  ┌──────┐    match → extend / rebuild（全命中亦是 rebuild）          ┌─────────┐
   │ IDLE │ ──────────────────────────────────────────────────────> │ PREFILL │
   └──────┘    整段 H2D input_ids；首合并步带首 chunk                 └─────────┘
      ↑  ^                                                           │ 最后 chunk
@@ -99,7 +99,7 @@ loop:
 
 | 当前 | 事件 | 动作 | 次态 |
 |---|---|---|---|
-| IDLE | UserMsg 绑定本流 | match（extend / rebuild / 退化）；整段 H2D | PREFILL |
+| IDLE | UserMsg 绑定本流 | match（extend / rebuild，全命中亦是 rebuild，cache.md §6）；整段 H2D | PREFILL |
 | PREFILL | chunk 完成、有剩余 | 无——下一合并步自然续 | PREFILL |
 | PREFILL | 最后 chunk 完成 | 采样首 token、emit；若即 eos 直接收尾 | DECODE / IDLE |
 | PREFILL | Abort | 停在合并步边界；emit `finished=true`（next_token=-1 占位）；**len = 已喂的 k 个 token** | IDLE |

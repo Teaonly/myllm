@@ -76,7 +76,7 @@ admit(uid, input_ids):
 - **busy 即拒，不排队**：同对话的跟进请求（目标 slot 在途）同样吃 busy——**亲和优先于即时可用性**，宁可重试等位置，也不在冷流上重建分叉的对话缓存。重试交给客户端 SDK 的指数退避（OpenAI/Anthropic SDK 对 503/529 默认自动重试）；后端因此零队列状态、零 abort/exit 的排队边缘语义。
 - 检查顺序 busy 相关判定在 tokenize 之后（input_ids 已有）、prefill 之前——拒绝时 HTTP 侧还没写过任何响应字节，可返回干净的非流式错误。
 - stdin 是串行流：多条请求哪怕打包在一个 `BatchBackendMsg` 里也逐条准入，无竞态。
-- **全命中退化**：`LCP == len(input_ids)`（input 是 materialized 的前缀，如重发同一 prompt）→ 截到 len−1 重算最后 1 个 token，保证至少一步 forward。
+- **全命中**：`LCP == len(input_ids)`（input 是 materialized 的前缀，如重发同一 prompt）→ 按 rebuild 处理。GDN 状态不可回退一步（递推不可逆），attention-only 引擎"截断重算最后一个 token"的技巧对 hybrid 不成立；全命中语义上只是 rebuild 的一个特例（罕见场景：重发同一 prompt）。
 - 图像输入（将来）：占位 token 的位置需对照 `images` 路径数组一并比较（前端已内容寻址，路径相等 = 内容相等），纯后端内部逻辑，协议不动。
 
 ## 6. 前缀语义
@@ -85,9 +85,8 @@ admit(uid, input_ids):
 
 | 情形 | 判定 | 行为 |
 |---|---|---|
-| extend | LCP == slot.len | 只 prefill 后缀 |
-| rebuild | LCP < slot.len | `reset()`（递归状态清零——GDN 零状态是递推的数学起点，不只是卫生）后全量 prefill |
-| 全命中 | LCP == len(input) | 截 1 token 重算（§5） |
+| extend | LCP == slot.len 且 input 更长 | 只 prefill 后缀 |
+| rebuild（含分叉 / 新对话 / 全命中） | 其余一切 | `reset()`（递归状态清零——GDN 零状态是递推的数学起点，不只是卫生）后全量 prefill |
 
 不做"回退到 LCP"：注意力侧截断免费，但 GDN S 无法时间平移；锚点快照复用（Infernix radix spec 那套）明确非目标。
 
