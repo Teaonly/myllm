@@ -8,6 +8,7 @@
 - [docs/architecture.md](docs/architecture.md) — 前后端职责与协议入口
 - [docs/protocol.md](docs/protocol.md) — 数据交互定义，复用 mini-sglang 消息设计
 - [docs/cache.md](docs/cache.md) — Cache 模块设计：对等双流、准入路由与前缀语义
+- [docs/overlap.md](docs/overlap.md) — Overlap 调度设计：单循环滞后一批、乐观推进、token 池 GPU 闭环（研读 mini-sglang）
 
 ## 第三方参考实现
 
@@ -17,7 +18,7 @@
 - **llama.cpp** — 工业级 hybrid cache 抽象（recurrent/attn 双模块 + layer filter）、GDN 的 ggml 算子契约与图级 chunked 实现
 - **Infernix**（C++/CUDA）— hybrid 前缀缓存最完整设计 spec（`docs/maintainer/`）、GDN chunked kernel（两段式）、数值契约一手记录
 - **ninfer-3090**（C++/CUDA）— SM8x（Ampere；A100=SM8.0）移植清单、ReplaySSM record/fold、CUDA Graph 按精确 batch 捕获
-- **mini-sglang**（Python）— 前后端进程拆分与消息协议（本仓 stdio 形态的对标）、增量 detokenize 状态机
+- **mini-sglang**（Python）— 前后端进程拆分与消息协议（本仓 stdio 形态的对标）、增量 detokenize 状态机、overlap 调度（见 docs/overlap.md）
 
 ## 核心要求
 
