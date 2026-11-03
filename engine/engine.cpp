@@ -46,7 +46,7 @@ Engine::Engine(const SchedulerConfig& cfg, StepExecutor& exec, std::istream& in,
 
 void Engine::dispatch_(proto::Inbound& msg) {
     if (auto* u = std::get_if<proto::UserMsg>(&msg)) {
-        sched_.admit(u->uid, std::move(u->input_ids), u->params);  // 拒绝场景已代发 ErrorMsg
+        sched_.admit(u->uid, std::move(u->input_ids), u->params);
     } else if (auto* a = std::get_if<proto::AbortMsg>(&msg)) {
         sched_.abort(a->uid);  // 未知/已终结 uid 静默忽略（不变量 3）
     } else {
@@ -76,8 +76,8 @@ void Engine::run() {
                 }
             }
         }
-        sched_.pump();  // 收割上一个在飞步 + 提交下一个（深度 1）
-        sink_.flush();  // 本迭代所有行 coalesce（S6）
+        sched_.pump();  // 驱动调度器推进
+        sink_.flush();  // 本迭代所有行 coalesce
     }
 
     // Exit/EOF 已定：先排空在途（finished 行先行，时序 §6），再回绝滞留在

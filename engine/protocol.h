@@ -5,7 +5,7 @@
 // stdin 侧：一行一 JSON 对象，`__type__` 标类型；BatchBackendMsg 打包逐条
 // 解包；未知字段与未知消息类型一律忽略（protocol.md 编码规则——前向兼容）。
 // stdout 侧：DetokenizeMsg 单行直发，多条由 encode_token_rows 打包成
-// BatchTokenizerMsg（scheduler.md S6 每迭代 coalesce）。
+// BatchTokenizerMsg（每迭代 coalesce）。
 //
 // JSON 解析用 vendored 的 nlohmann/json v3.11.3 单头文件（engine/opt/
 // nlohmann/json.hpp，-I engine/opt）；实现细节封在 protocol.cpp，本头文件
@@ -22,8 +22,7 @@
 namespace engine::proto {
 
 // 采样参数（protocol.md 的 sampling_params 字段）。调度器只消费 ignore_eos
-// 与 max_tokens（stop 判定在 host，scheduler.md §1）；其余字段将来随段
-// 透传给采样 kernel。
+// 与 max_tokens（stop 判定在 host）；其余字段将来随段透传给采样 kernel。
 struct SamplingParams {
     float temperature = 0.0f;
     int top_k = -1;
@@ -58,7 +57,7 @@ struct TokenRow {
     bool finished;
 };
 
-// 1 行 → DetokenizeMsg；多行 → BatchTokenizerMsg 打包（S6）。
+// 1 行 → DetokenizeMsg；多行 → BatchTokenizerMsg 打包。
 std::string encode_token_rows(const std::vector<TokenRow>& rows);
 
 // code 为空串时省略 code 字段（protocol.md：缺省 = 未分类错误）。

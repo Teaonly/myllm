@@ -11,7 +11,7 @@ Cache 模块 = **每流推理期状态的全部所有者 + 请求准入**。不�
 - 生命周期：len 推进、reset、truncate（投机预留）；
 - 视图分发：给 kernel 裸指针 + 编译期步长，不做抽象层。
 
-GPU 动作只有分配与 reset 的 memset。uid 的协议职责（回带、终结行）在主循环；Cache 只认 slot 索引，准入的 argmax/busy/LRU 判定也在主循环（§5，调度设计见 [scheduler.md](scheduler.md)）。
+GPU 动作只有分配与 reset 的 memset。uid 的协议职责（回带、终结行）在主循环；Cache 只认 slot 索引，准入的 argmax/busy/LRU 判定也在主循环（§5；调度设计文档随重构重写）。
 
 ## 1. 架构语义：对等双流
 

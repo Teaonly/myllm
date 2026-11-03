@@ -8,7 +8,6 @@
 - [docs/architecture.md](docs/architecture.md) — 前后端职责与协议入口
 - [docs/protocol.md](docs/protocol.md) — 数据交互定义，复用 mini-sglang 消息设计
 - [docs/cache.md](docs/cache.md) — Cache 模块设计：对等双流、准入路由与前缀语义
-- [docs/scheduler.md](docs/scheduler.md) — 调度器设计：事件循环、每流状态机与合并步
 
 ## 第三方参考实现
 
