@@ -19,7 +19,7 @@
 #include <variant>
 #include <vector>
 
-namespace engine::proto {
+namespace myllm {
 
 // 采样参数（protocol.md 的 sampling_params 字段）。调度器只消费 ignore_eos
 // 与 max_tokens（stop 判定在 host）；其余字段将来随段透传给采样 kernel。
@@ -63,4 +63,4 @@ std::string encode_token_rows(const std::vector<TokenRow>& rows);
 // code 为空串时省略 code 字段（protocol.md：缺省 = 未分类错误）。
 std::string encode_error(int uid, std::string_view code, std::string_view message);
 
-}  // namespace engine::proto
+}  // namespace myllm

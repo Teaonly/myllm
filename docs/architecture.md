@@ -27,3 +27,20 @@
 - 结构与 Strata 相反：它是 8700 行单文件 + stdlib http.server，myllm 按核心要求拆小模块。
 - 本机 Python 3.14 无 pip / python3-venv：环境一律用 uv 建（`uv venv .venv && uv pip install -r requirements.txt`）。
 - 图像落盘用内容寻址：sha256(原始字节) 作文件名（如 /var/tmp/myllm-img/<sha256>.<ext>）。同图同路径，天然去重、后端前缀缓存必命中；删除按 hash 引用计数归零执行（uid 开始 +1，finished/ErrorMsg −1），与协议的图像有效期规则对齐。
+
+## 后端技术架构
+
+### Overlap 调度
+
+采用 overlap 调度结构，即 CUDA 计算通过一个 input / output 的两层以上的 fifo, 确保 cuda 主计算流不卡顿，所有 D2H / H2D 均采用独立的 cuda stream，同步使用 cudaEvent 来实现。
+
+每次调度循环，D2H 拿到数据是 fifo 最"旧"的数据，节拍上滞后的，这样就可以实现所谓 Overlap 了。
+
+### Scheduler 是后端的核心架构主体
+
+负责和前端的交付，处理 STDIN / STDOUT 的读写，按照 NDJOSN 进行协议解析。
+核心是 Overlap 循环，每次循环完成一次 H2D 写入， D2H 的读取，以及 STDIN 新数据的查询。
+
+### Engine 是计算的抽象类
+
+完成具体的计算，完成Prefill/decode 状态管理，管理 Cache 内存等工作。

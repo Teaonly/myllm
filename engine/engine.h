@@ -22,45 +22,14 @@
 #include "protocol.h"
 #include "scheduler.h"
 
-namespace engine {
-
-// OutputSink 真实现：协议编码 + BatchTokenizerMsg 攒批。
-// token 行按到达顺序分组打包；error 行保序直排（不变量 2 只约束同 uid，
-// 不同 uid 行序无约束，故 error 穿插在批间是合法的）。
-class StreamSink final : public OutputSink {
-public:
-    explicit StreamSink(std::ostream& out) : out_(out) {}
-
-    void emit_token(int uid, int32_t token, bool finished) override;
-    void emit_error(int uid, std::string_view code, std::string_view message) override;
-
-    // 每个事件循环迭代末尾调用：连续 token 行打包成一条（每迭代至多一批）。
-    void flush();
-
-private:
-    struct Pending {
-        bool is_error;
-        proto::TokenRow row;  // is_error == false 时有效
-        std::string line;     // is_error == true 时有效（已编码）
-    };
-    std::ostream& out_;
-    std::vector<Pending> pending_;
-};
+namespace myllm {
 
 class Engine {
 public:
-    Engine(const SchedulerConfig& cfg, StepExecutor& exec, std::istream& in, std::ostream& out);
-
-    // 阻塞直至 ExitMsg（或 stdin EOF）排空完成。流由调用方注入，测试以
-    // istringstream/ostringstream 驱动整条链路。
-    void run();
+    Engine();
 
 private:
-    void dispatch_(proto::Inbound& msg);  // 翻译成 scheduler 调用，无决策
-
-    std::istream& in_;
-    StreamSink sink_;
-    Scheduler sched_;
+    
 };
 
-}  // namespace engine
+}  // namespace myllm

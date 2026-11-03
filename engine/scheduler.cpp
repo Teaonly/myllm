@@ -3,15 +3,14 @@
 // ===========================================================================
 #include "scheduler.h"
 
-namespace engine {
+namespace myllm {
 
-Scheduler::Scheduler(const SchedulerConfig& cfg, StepExecutor& exec, OutputSink& sink)
-    : cfg_(cfg), exec_(exec), sink_(sink) {}
+Scheduler::Scheduler(const SchedulerConfig& cfg, std::istream& in, std::ostream& out)
+    : cfg_(cfg), 
+      in_(in), 
+      out_(out) {}
 
-void Scheduler::admit(int, std::vector<int32_t>, const proto::SamplingParams&) {}
-void Scheduler::abort(int) {}
-void Scheduler::request_exit() {}
-void Scheduler::pump() {}
-bool Scheduler::idle() const { return true; }
 
-}  // namespace engine
+
+
+}  // namespace myllm

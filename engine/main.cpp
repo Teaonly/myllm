@@ -9,35 +9,9 @@
 #include <vector>
 
 #include "engine.h"
-#include "model_constants.h"
-
-namespace {
-
-class StubExecutor final : public engine::StepExecutor {
-public:
-    void run_step(const std::vector<engine::Segment>& segs, engine::StepResult& out) override {
-        out.per_lane.assign(2, engine::LaneResult{});
-        for (const auto& g : segs) {
-            if (!g.samples) continue;
-            int32_t t;
-            switch (++count_[g.uid]) {
-                case 1: t = 5; break;
-                case 2: t = 6; break;
-                default: t = model::EOS; break;
-            }
-            out.per_lane[g.slot] = {true, t};
-        }
-    }
-
-private:
-    std::map<int, int> count_;
-};
-
-}  // namespace
+#include "scheduler.h"
+#include "qwen3.8-next.h"
 
 int main() {
-    StubExecutor exec;
-    engine::Engine eng(engine::SchedulerConfig{}, exec, std::cin, std::cout);
-    eng.run();
     return 0;
 }
