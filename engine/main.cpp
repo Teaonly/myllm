@@ -13,5 +13,8 @@
 #include "qwen3.8-next.h"
 
 int main() {
+    // Scheduler::read_line 的快路径依赖 cin 自有缓冲（见 scheduler.h 注释），
+    // 必须在任何 IO 之前关闭与 C stdio 的同步。
+    std::ios::sync_with_stdio(false);
     return 0;
 }

@@ -204,8 +204,8 @@ bool decode_line(std::string_view line, std::vector<Inbound>& out, std::string& 
 // 又是每步热路径,snprintf 到栈缓冲即够且字节精确。唯一交回库的是 error
 // 行的字符串转义——json(string).dump() 即"加引号 + 全部合法转义"的成品。
 
-std::string encode_token_rows(const std::vector<TokenRow>& rows) {
-    auto one = [](const TokenRow& r) {
+std::string encode_token_rows(const std::vector<Outbound>& rows) {
+    auto one = [](const Outbound& r) {
         char buf[96];
         std::snprintf(buf, sizeof buf,
                       "{\"__type__\":\"DetokenizeMsg\",\"uid\":%d,\"next_token\":%d,\"finished\":%s}",

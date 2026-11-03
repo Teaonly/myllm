@@ -15,7 +15,11 @@
 #pragma once
 
 #include <cstdint>
+#include <istream>
+#include <ostream>
+#include <string>
 #include <string_view>
+#include <unistd.h>  // STDIN_FILENO
 #include <vector>
 
 #include "protocol.h"
@@ -26,18 +30,32 @@ namespace myllm {
 // 调度器配置。字段随新设计定义，当前为空。
 struct SchedulerConfig {};
 
-
-// ---- 空调度器 ------------------------------------------------------------------
+// 带超时读 stdin 的三态结果。
+enum class ReadStatus {
+    Line,     // 读到一行（可能为空行，调用方自行跳过）
+    Timeout,  // 限时内无数据，流状态不变
+    Eof,      // 流结束（前端死亡 = 隐式 Exit），此后恒返回 Eof
+};
 
 class Scheduler {
 public:
-    Scheduler(const SchedulerConfig& cfg, std::istream& in, std::ostream& out);
-    void run();
+    // in_fd：in_ 背后的文件描述符（read_line 里 poll 的对象）。测试注入
+    // 临时文件 fd（普通文件恒就绪 → Eof 路径可测）或空管道（→ Timeout 可
+    // 测）；生产用默认的 stdin。
+    Scheduler(const SchedulerConfig& cfg, std::istream& in, std::ostream& out,
+              int in_fd = STDIN_FILENO);
+    void run_loop(Engine& engine);
+
+    // 带超时读一行 stdin（主循环每拍的第 0 步）。
+    //   timeout_ms：-1 无限阻塞（彻底空闲时）；0 立即返回（纯轮询）；
+    //               >0 最多等这么多毫秒。
+    ReadStatus read_line(std::string& line, int timeout_ms);
 
 private:
     SchedulerConfig cfg_;
     std::istream& in_;
     std::ostream& out_;
+    int in_fd_;
 };
 
 }  // namespace myllm

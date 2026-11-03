@@ -51,14 +51,14 @@ bool decode_line(std::string_view line, std::vector<Inbound>& out, std::string& 
 
 // ---- stdout 侧编码 ----------------------------------------------------------
 
-struct TokenRow {
+struct Outbound {
     int uid;
     int32_t next_token;
     bool finished;
 };
 
 // 1 行 → DetokenizeMsg；多行 → BatchTokenizerMsg 打包。
-std::string encode_token_rows(const std::vector<TokenRow>& rows);
+std::string encode_token_rows(const std::vector<Outbound>& rows);
 
 // code 为空串时省略 code 字段（protocol.md：缺省 = 未分类错误）。
 std::string encode_error(int uid, std::string_view code, std::string_view message);
