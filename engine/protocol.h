@@ -7,8 +7,9 @@
 // stdout 侧：DetokenizeMsg 单行直发，多条由 encode_token_rows 打包成
 // BatchTokenizerMsg（scheduler.md S6 每迭代 coalesce）。
 //
-// JSON 解析是内置的最小实现（protocol.cpp 匿名命名空间）：只服务本协议的
-// 固定形态，零外部依赖；不追求通用正确性之外的任何东西。
+// JSON 解析用 vendored 的 nlohmann/json v3.11.3 单头文件（engine/opt/
+// nlohmann/json.hpp，-I engine/opt）；实现细节封在 protocol.cpp，本头文件
+// 不感知库的存在。
 // ===========================================================================
 #pragma once
 
@@ -18,9 +19,18 @@
 #include <variant>
 #include <vector>
 
-#include "scheduler.h"
-
 namespace engine::proto {
+
+// 采样参数（protocol.md 的 sampling_params 字段）。调度器只消费 ignore_eos
+// 与 max_tokens（stop 判定在 host，scheduler.md §1）；其余字段将来随段
+// 透传给采样 kernel。
+struct SamplingParams {
+    float temperature = 0.0f;
+    int top_k = -1;
+    float top_p = 1.0f;
+    bool ignore_eos = false;
+    int max_tokens = 1024;
+};
 
 struct UserMsg {
     int uid = 0;
