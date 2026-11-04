@@ -1,25 +1,25 @@
 // ===========================================================================
-// scheduler.h — 调度器（重构起点：空骨架）
+// scheduler.h — Scheduler：进程主体（architecture.md §后端技术架构）
 // ===========================================================================
 //
-// 旧实现（双流状态机 + LCP 准入 + 合并步收集）与配套设计文档已整体移除，
-// 历史版本见 git（commit 2358497 附近）。新实现与新的设计定案文档将随重
-// 构在本文件内从零长出，旧代码只作参考、不作约束。
+// 角色：stdin/stdout 全 fd 直读直写 + NDJSON 协议 + 慢一拍 overlap 主循环；
+// 计算全部委托 Engine（测试挂假 Engine 即可驱动全部协议行为，见 engine.h）。
 //
-// 当前仅保留与 Engine 的装配契约，使进程可编译、可跑通协议链路：
-//   - Engine 构造 Scheduler(cfg, exec, sink)，执行器与协议输出经接口注入；
-//   - 主循环调 admit / abort / request_exit / pump / idle 五个方法。
-// 方法全部为空——请求被静默吞掉、不产出 token；idle() 恒真保证 Exit/EOF
-// 后 Engine 的排空循环立即通过、进程正常退出（不挂死）。
+// 为什么不用 iostream：istream 抽象不暴露 fd，而 poll(2) 只认 fd——
+// “同一条流传两遍（istream + fd）”只能靠约定保持一致；且 getline 吃进半
+// 行后无法“超时返回、残行留待下拍”。fd + 自管行缓冲把两个问题一起解决。
+//
+// 主循环 run_loop 每拍五步：⓪ 抽干 stdin 收请求（read_line）→
+// ① async_h2d → ② async_forward → ③ async_d2h → ④ sync_recv。四段对
+// Engine 全是非阻塞入队，唯一阻塞点是 ④——“计算不暂停”的保证在 Engine
+// 侧的三流事件环（cuda_engine.h）。
 // ===========================================================================
 #pragma once
 
 #include <cstdint>
-#include <istream>
-#include <ostream>
 #include <string>
 #include <string_view>
-#include <unistd.h>  // STDIN_FILENO
+#include <unistd.h>  // STDIN_FILENO / STDOUT_FILENO
 #include <vector>
 
 #include "protocol.h"
@@ -30,32 +30,41 @@ namespace myllm {
 // 调度器配置。字段随新设计定义，当前为空。
 struct SchedulerConfig {};
 
-// 带超时读 stdin 的三态结果。
+// 带超时读一行的三态结果。
 enum class ReadStatus {
     Line,     // 读到一行（可能为空行，调用方自行跳过）
-    Timeout,  // 限时内无数据，流状态不变
-    Eof,      // 流结束（前端死亡 = 隐式 Exit），此后恒返回 Eof
+    Timeout,  // 限时内无完整行；已读数据留在缓冲，流状态不变
+    Eof,      // 流结束（前端死亡 = 隐式退出），此后恒返回 Eof
 };
 
 class Scheduler {
 public:
-    // in_fd：in_ 背后的文件描述符（read_line 里 poll 的对象）。测试注入
-    // 临时文件 fd（普通文件恒就绪 → Eof 路径可测）或空管道（→ Timeout 可
-    // 测）；生产用默认的 stdin。
-    Scheduler(const SchedulerConfig& cfg, std::istream& in, std::ostream& out,
-              int in_fd = STDIN_FILENO);
+    // 两个 fd 就是协议通道的全部。生产用默认的 stdin/stdout；测试注入
+    // 任意 fd：输入端接临时文件（数据恒就绪 → Eof 路径可测）或空管道
+    // （→ Timeout 可测）；输出端接管道读端，断言编码出的 NDJSON 行。
+    Scheduler(const SchedulerConfig& cfg, int in_fd = STDIN_FILENO,
+              int out_fd = STDOUT_FILENO);
     void run_loop(Engine& engine);
 
-    // 带超时读一行 stdin（主循环每拍的第 0 步）。
+    // 带超时读一行（主循环每拍的第 0 步）。
     //   timeout_ms：-1 无限阻塞（彻底空闲时）；0 立即返回（纯轮询）；
     //               >0 最多等这么多毫秒。
+    //   残行不吞：限时内凑不齐换行符就返回 Timeout，半行留在缓冲下拍续。
     ReadStatus read_line(std::string& line, int timeout_ms);
 
 private:
+    // 把 s 完整写出（对付短写与 EINTR）。false = 对端已死（典型 EPIPE），
+    // 调用方按“前端死亡”处理——与读侧 Eof 对称的写侧死亡检测。
+    bool write_all(std::string_view s);
+
     SchedulerConfig cfg_;
-    std::istream& in_;
-    std::ostream& out_;
     int in_fd_;
+    int out_fd_;
+
+    // 读缓冲：0..n 条完整行 + 至多一条残行。read_line 只从这里切行，
+    // poll/read 只往这里补货；残行跨拍存活（istream 方案还不掉的债）。
+    std::string buf_;
+    bool eof_ = false;  // 对端关闭后 latch，此后 read_line 恒返回 Eof
 };
 
 }  // namespace myllm

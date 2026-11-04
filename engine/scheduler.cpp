@@ -1,40 +1,78 @@
 // ===========================================================================
-// scheduler.cpp — read_line 与 overlap 主循环（见 scheduler.h 头注）
+// scheduler.cpp — fd 读写底座 + overlap 主循环（见 scheduler.h 头注）
 // ===========================================================================
+#include <cerrno>
 #include <iostream>
 #include <poll.h>
+#include <unistd.h>
 
 #include "scheduler.h"
 
 namespace myllm {
 
-Scheduler::Scheduler(const SchedulerConfig& cfg, std::istream& in, std::ostream& out,
-                     int in_fd)
+Scheduler::Scheduler(const SchedulerConfig& cfg, int in_fd, int out_fd)
     : cfg_(cfg),
-      in_(in),
-      out_(out),
-      in_fd_(in_fd) {}
+      in_fd_(in_fd),
+      out_fd_(out_fd) {}
 
-// 实现注：先查 istream 自己的缓冲——上一次 getline 可能多读进来一整
-// 行，此时 fd 已无数据，直接 poll 会误判超时、那行就饿死在缓冲里；
-// 缓冲空才去 poll fd。为此 main() 必须 sync_with_stdio(false)，否则
-// 缓冲由 C stdio 代管、in_avail() 恒 0，快路径失效。
-// 已知取舍：超长行（input_ids 巨大）分多次 write 到达时，getline 会
-// 阻塞至凑齐换行，期间主循环不 tick——毫秒级，接受。
+// 实现注（对照旧 istream 版的两个进步）：
+//   - 残行不吞：限时内凑不齐换行符就 Timeout，半行留在 buf_ 下拍续读
+//     （getline 一旦吃进半行就阻塞到凑齐，超时语义对半行失效）；
+//   - EOF 判定统一在 read：poll 就绪但 read 返回 0 即对端关闭（POLLHUP
+//     也走这里），latch 到 eof_ 后恒返回 Eof。
 ReadStatus Scheduler::read_line(std::string& line, int timeout_ms) {
-    if (in_.eof()) return ReadStatus::Eof;
+    if (eof_) return ReadStatus::Eof;
 
-    // ① istream 缓冲里已有字符：getline 不会阻塞，跳过 poll
-    if (in_.rdbuf()->in_avail() <= 0) {
-        // ② 缓冲空：等 fd 就绪再读，限时即返（-1 = 无限等，0 = 纯轮询）
+    for (;;) {
+        // ① 缓冲里有完整行 → 切出 [0, nl)，换行符随之吞掉
+        size_t nl = buf_.find('\n');
+        if (nl != std::string::npos) {
+            line.assign(buf_, 0, nl);
+            buf_.erase(0, nl + 1);
+            return ReadStatus::Line;
+        }
+
+        // ② 没有完整行 → 限时等数据（-1 无限等，0 纯轮询）
         struct pollfd pfd{in_fd_, POLLIN, 0};
         int n = ::poll(&pfd, 1, timeout_ms);
         if (n == 0) return ReadStatus::Timeout;
-        if (n < 0) return ReadStatus::Eof;  // poll 出错：按 EOF 处理，进程该退了
-    }
+        if (n < 0) {
+            if (errno == EINTR) continue;  // 被信号打断：接着等
+            eof_ = true;                   // poll 出错：按前端死亡处理
+            return ReadStatus::Eof;
+        }
 
-    if (!std::getline(in_, line)) return ReadStatus::Eof;  // 对端关闭（POLLHUP 也走这里）
-    return ReadStatus::Line;
+        // ③ 就绪 → 读一块进缓冲（就绪后的 read 不会再阻塞）
+        char chunk[4096];
+        ssize_t got = ::read(in_fd_, chunk, sizeof chunk);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            eof_ = true;
+            return ReadStatus::Eof;
+        }
+        if (got == 0) {  // 对端关闭（含 POLLHUP）
+            eof_ = true;
+            return ReadStatus::Eof;
+        }
+        buf_.append(chunk, static_cast<size_t>(got));
+        // 回到 ①：这一块里可能正好凑齐一行，甚至好几行
+    }
+}
+
+// 把 s 完整写出。短写循环补齐、EINTR 重试；其余错误（典型 EPIPE：前端
+// 已死）返回 false。前置条件：main 已忽略 SIGPIPE，否则对死前端的第一次
+// write 会直接杀死进程，走不到这里的 false。
+bool Scheduler::write_all(std::string_view s) {
+    size_t off = 0;
+    while (off < s.size()) {
+        ssize_t put = ::write(out_fd_, s.data() + off, s.size() - off);
+        if (put < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        off += static_cast<size_t>(put);
+    }
+    return true;
 }
 
 // Overlap 循环
