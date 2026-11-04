@@ -1,20 +1,28 @@
 // ===========================================================================
-// main.cpp — 进程入口：stdin/stdout 装配（协议 codec 在 Engine 内部）
+// main.cpp — 进程入口：装配 Scheduler（协议主体）与 CudaEngine（计算）
 // ===========================================================================
-// executor 当前为占位实现（采样值写死），随新调度器接入后生效；CUDA 合并
-// 步 executor 落地时整体替换，Engine 与 Scheduler 的装配接口不变。
+//
+// 装配就三件事：
+//   1. 关闭 iostream 与 C stdio 的同步——read_line 的 in_avail() 快路径
+//      依赖 cin 自有缓冲（见 scheduler.cpp 实现注）；
+//   2. 构造 CudaEngine 并 prepare()：三流 / 六事件 / bootstrap，必须在
+//      run_loop 之前一次性完成；
+//   3. 构造 Scheduler（cin/cout 即 NDJSON 通道），进入慢一拍 overlap 主
+//      循环，直到 stdin 关闭（Eof）退出。
 // ===========================================================================
 #include <iostream>
-#include <map>
-#include <vector>
 
-#include "engine.h"
+#include "cuda_engine.h"
 #include "scheduler.h"
-#include "qwen3.8-next.h"
 
 int main() {
-    // Scheduler::read_line 的快路径依赖 cin 自有缓冲（见 scheduler.h 注释），
-    // 必须在任何 IO 之前关闭与 C stdio 的同步。
     std::ios::sync_with_stdio(false);
+
+    myllm::SchedulerConfig cfg;  // 字段随设计长出，当前为空
+    myllm::CudaEngine engine;
+    engine.prepare();
+
+    myllm::Scheduler scheduler(cfg, std::cin, std::cout);
+    scheduler.run_loop(engine);
     return 0;
 }
