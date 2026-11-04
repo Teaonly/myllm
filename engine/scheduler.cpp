@@ -1,5 +1,5 @@
 // ===========================================================================
-// scheduler.cpp — 空实现（重构起点，见 scheduler.h 头注）
+// scheduler.cpp — read_line 与 overlap 主循环（见 scheduler.h 头注）
 // ===========================================================================
 #include <iostream>
 #include <poll.h>
@@ -44,37 +44,46 @@ void Scheduler::run_loop(Engine& engine) {
     std::string err;
     std::string line;
 
-    // 0. 查询 STDIN 是否有输入, 带上极短的超时，避免阻塞。
+    // 0. STDIN → 请求对象：抽干本拍到达的全部行。
+    //    首读带 1ms 超时（空闲时的节拍；Engine idle 信号落地后改 -1 阻塞
+    //    读）；一旦读到行就改纯轮询（0ms），把已缓冲的行全部收完——一拍
+    //    可收进零到多条消息（一行 Batch 解包后还会更多）。解析失败按前端
+    //    bug 处理：记 stderr、跳过该行、继续收。
     auto status = read_line(line, 1);
-    if (status == ReadStatus::Line) {
-      if ( decode_line(line, reqs, err) ) {
-        
-      } else {
-        // 解析失败，打印错误信息到 stderr, 并继续循环。
+    while (status == ReadStatus::Line) {
+      if (!decode_line(line, reqs, err)) {
         std::cerr << "decode_line failed: " << err << std::endl;
       }
-    } else if (status == ReadStatus::Timeout) {
-      reqs.clear();
-    } else if (status == ReadStatus::Eof) {
-      // 对端关闭，退出循环。
-      break;
+      status = read_line(line, 0);
     }
-  
+    // 读到 EOF 结束主循环
+    if (status == ReadStatus::Eof) {
+      std::cerr << "read_line EOF, break loop." << std::endl;
+      return;
+    }
+    // 读到 ExitMsg 结束主循环
+    for (auto it = reqs.begin(); it != reqs.end(); ++it) {
+      if (std::holds_alternative<ExitMsg>(*it)) {
+        std::cerr << "received ExitMsg, break loop." << std::endl;
+        return;
+      }
+    }
+
     // 1. 处理请求
     engine.async_h2d(reqs);
 
     // 2. 执行前向计算
     engine.async_forward();
 
-    // 3. 上传当前的结果
+    // 3. 拷回本拍结果
     engine.async_d2h();
 
     // 4. 等待之前的交付
     std::vector<Outbound> results;
     engine.sync_recv(results);
+
+    
   }
-
-
 }
 
 
