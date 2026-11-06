@@ -36,6 +36,6 @@ compute_done 告诉拷贝流结果出炉，d2h_done 告诉主机可以收货。
 ## 对应
 
 `scheduler.cpp` 的 run_loop 每拍五步即此节拍：⓪ 收消息 → ① async_h2d →
-② async_forward → ③ async_d2h → ④ sync_recv（唯一阻塞点）。`cuda_engine.cpp`
+② async_forward → ③ async_d2h → ④ sync_recv（唯一阻塞点）。`cuda/cuda_engine.cpp`
 是三流 + 事件环的实现。原型为 mini-sglang 的 overlap 调度；逐行研读笔记的历史
 版本见 git（commit f7bf6e4）。

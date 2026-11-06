@@ -15,7 +15,7 @@
 
 #include <unistd.h>
 
-#include "cuda_engine.h"
+#include "cuda/cuda_engine.h"  // CUDA 具体实现都在 cuda/ 子目录
 #include "scheduler.h"
 
 int main() {
