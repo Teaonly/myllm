@@ -11,7 +11,8 @@
 // 调用契约（Scheduler::run_loop 每拍的节拍；单线程调用，无锁）：
 //   prepare       —— run_loop 之前一次性初始化；
 //   每拍四段，顺序即调用顺序：
-//   async_h2d     —— 收下本拍到达的消息（可为空）：准入 + H2D 入队，非阻塞；
+//   async_h2d     —— 收下本拍到达的消息（可为空）：准入 + H2D 入队，非阻塞
+//                    （拒绝不即时回，经 ④ 的 ErrorRow 晚一拍出，不变量 1）；
 //   async_forward —— 组下一步（prefill chunk / decode 合并步），计算流入
 //                    队，非阻塞；
 //   async_d2h     —— D2H 拷贝入队：拷本拍结果（compute_done 门控），非阻塞；
@@ -20,7 +21,8 @@
 //                    安全的空操作。
 //
 // 语义保证（Engine 侧不变量，与 protocol.md §不变量 一一对应）：
-//   1. 准入是纯 host 侧判定，不碰 GPU；被拒（busy / 超长）的 uid 零产出；
+//   1. 准入是纯 host 侧判定，不碰 GPU；被拒（busy / 超长）的 uid 零 token
+//      产出，拒绝以 ErrorRow（protocol.h）随 ④ 出——对到达拍至多晚一拍；
 //   2. 每个 Accepted 的 uid 恰好以一行 finished=true 收尾（EOS / max_tokens
 //      / 写满 ctx_cap 强制收尾 / abort，任一触发）；
 //   3. 同 uid 的产出严格按生成顺序到达；不同 uid 的交错顺序无约束；
@@ -36,15 +38,6 @@
 #include "protocol.h"  // SamplingParams（前后端唯一共享的参数结构，不另造副本）
 
 namespace myllm {
-
-// 准入判定结果。Scheduler 负责翻译成协议行（Engine 不知道 wire 的存在）：
-//   Busy    → ErrorMsg(code=busy)，瞬态，客户端 SDK 自动重试；
-//   TooLong → ErrorMsg(code=context_length_exceeded)，永久。
-enum class SubmitStatus {
-    Accepted,
-    Busy,
-    TooLong,
-};
 
 class Engine {
 public:

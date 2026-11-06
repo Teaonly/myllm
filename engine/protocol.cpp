@@ -23,7 +23,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace engine::proto {
+namespace myllm {
 
 using nlohmann::json;
 
@@ -204,8 +204,8 @@ bool decode_line(std::string_view line, std::vector<Inbound>& out, std::string& 
 // 又是每步热路径,snprintf 到栈缓冲即够且字节精确。唯一交回库的是 error
 // 行的字符串转义——json(string).dump() 即"加引号 + 全部合法转义"的成品。
 
-std::string encode_token_rows(const std::vector<Outbound>& rows) {
-    auto one = [](const Outbound& r) {
+std::string encode_token_rows(const std::vector<TokenRow>& rows) {
+    auto one = [](const TokenRow& r) {
         char buf[96];
         std::snprintf(buf, sizeof buf,
                       "{\"__type__\":\"DetokenizeMsg\",\"uid\":%d,\"next_token\":%d,\"finished\":%s}",
@@ -235,4 +235,38 @@ std::string encode_error(int uid, std::string_view code, std::string_view messag
     return s;
 }
 
-}  // namespace engine::proto
+std::string encode_outbound(const std::vector<Outbound>& rows) {
+    // 错误行就地成段（reason → wire code 的映射只活在这条 switch 里），
+    // token 行攒到末尾打包——跨 uid 无顺序约束（不变量 3），同 uid 不可能
+    // 同时有两种形态（被拒即零 token 产出，不变量 1），分区不破坏语义。
+    std::string s;
+    std::vector<TokenRow> tokens;
+    for (const Outbound& r : rows) {
+        if (const auto* e = std::get_if<ErrorRow>(&r)) {
+            switch (e->reason) {
+            case RejectReason::Busy:
+                s += encode_error(e->uid, "busy",
+                                  e->message.empty()
+                                      ? "both streams in flight"
+                                      : e->message);
+                break;
+            case RejectReason::TooLong:
+                s += encode_error(e->uid, "context_length_exceeded",
+                                  e->message.empty()
+                                      ? "input_ids exceeds ctx_cap"
+                                      : e->message);
+                break;
+            }
+            s += '\n';
+        } else {
+            tokens.push_back(std::get<TokenRow>(r));
+        }
+    }
+    if (!tokens.empty()) {
+        s += encode_token_rows(tokens);
+        s += '\n';
+    }
+    return s;
+}
+
+}  // namespace myllm

@@ -120,11 +120,16 @@ void Scheduler::run_loop(Engine& engine) {
     // 3. 拷回本拍结果
     engine.async_d2h();
 
-    // 4. 等待之前的交付
+    // 4. 等待上一拍结果落地并交付：token 行打包、错误行各自成行。
+    //    写出失败 = 前端已死（典型 EPIPE），与读侧 Eof 对称，立即退出；
+    //    协议行直写 fd 无缓冲，即写即达，无需 flush 策略。
     std::vector<Outbound> results;
     engine.sync_recv(results);
+    if (!write_all(encode_outbound(results))) {
+      std::cerr << "write_all failed (frontend dead?), break loop." << std::endl;
+      return;
+    }
 
-    
   }
 }
 

@@ -4,8 +4,9 @@
 //
 // stdin 侧：一行一 JSON 对象，`__type__` 标类型；BatchBackendMsg 打包逐条
 // 解包；未知字段与未知消息类型一律忽略（protocol.md 编码规则——前向兼容）。
-// stdout 侧：DetokenizeMsg 单行直发，多条由 encode_token_rows 打包成
-// BatchTokenizerMsg（每迭代 coalesce）。
+// stdout 侧：token 行 1 条直发 DetokenizeMsg、多条打包 BatchTokenizerMsg；
+// 错误行各自一条 ErrorMsg（busy / context_length_exceeded）。一拍出口的
+// 整体编码见 encode_outbound。
 //
 // JSON 解析用 vendored 的 nlohmann/json v3.11.3 单头文件（engine/opt/
 // nlohmann/json.hpp，-I engine/opt）；实现细节封在 protocol.cpp，本头文件
@@ -51,16 +52,40 @@ bool decode_line(std::string_view line, std::vector<Inbound>& out, std::string& 
 
 // ---- stdout 侧编码 ----------------------------------------------------------
 
-struct Outbound {
+// 出口两态，与 Inbound 对称地用 variant 承载：
+//   TokenRow —— 正常产 token（逐 token 一行，finished=true 收尾）；
+//   ErrorRow —— 准入拒绝：被拒 uid 零 token 产出，只出一行错误
+//               （engine.h 不变量 1）。
+struct TokenRow {
     int uid;
     int32_t next_token;
     bool finished;
 };
 
-// 1 行 → DetokenizeMsg；多行 → BatchTokenizerMsg 打包。
-std::string encode_token_rows(const std::vector<Outbound>& rows);
+// 拒绝原因是语义枚举，不是 wire 串：Busy=瞬态可重试，TooLong=永久。
+// code=busy / context_length_exceeded 的映射只活在 protocol.cpp——
+// Engine 不知道 wire 的存在（engine.h 分层原则）。
+enum class RejectReason { Busy, TooLong };
 
-// code 为空串时省略 code 字段（protocol.md：缺省 = 未分类错误）。
+struct ErrorRow {
+    int uid;
+    RejectReason reason;
+    std::string message;  // 人类可读细节；空 = 按 reason 取缺省文案
+};
+
+using Outbound = std::variant<TokenRow, ErrorRow>;
+
+// token 行打包：1 行 → DetokenizeMsg；多行 → BatchTokenizerMsg。
+std::string encode_token_rows(const std::vector<TokenRow>& rows);
+
+// 一拍出口整体编码：token 行如上打包成一段，错误行各自一行 ErrorMsg。
+// 同 uid 不会有两种形态（被拒即零 token 产出，不变量 1）、跨 uid 无顺序
+// 约束（不变量 3），故分区不破坏语义。返回完整行（含行尾 \n），空输入
+// → 空串——调用方可直接 write_all。
+std::string encode_outbound(const std::vector<Outbound>& rows);
+
+// 单条错误行（不含 \n）。code 为空串时省略 code 字段（protocol.md：缺省
+// = 未分类错误）。
 std::string encode_error(int uid, std::string_view code, std::string_view message);
 
 }  // namespace myllm

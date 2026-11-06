@@ -11,7 +11,8 @@
 //
 // 主循环 run_loop 每拍五步：⓪ 抽干 stdin 收请求（read_line；ExitMsg /
 // EOF 结束循环）→ ① async_h2d → ② async_forward → ③ async_d2h →
-// ④ sync_recv。①②③ 对 Engine 是非阻塞入队；④ 是全循环唯一阻塞点——
+// ④ sync_recv 收上一拍结果、编码写出交付。①②③ 对 Engine 是非阻塞入队；
+// ④ 是全循环唯一阻塞点——
 // 主机等在上一拍 D2H 落地的事件上，这一等本身就是节拍器（节拍滞后一拍，
 // 即 overlap）。“计算不暂停”的保证在 Engine 侧的三流事件环
 // （cuda_engine.h）。
