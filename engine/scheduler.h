@@ -9,10 +9,12 @@
 // “同一条流传两遍（istream + fd）”只能靠约定保持一致；且 getline 吃进半
 // 行后无法“超时返回、残行留待下拍”。fd + 自管行缓冲把两个问题一起解决。
 //
-// 主循环 run_loop 每拍五步：⓪ 抽干 stdin 收请求（read_line）→
-// ① async_h2d → ② async_forward → ③ async_d2h → ④ sync_recv。四段对
-// Engine 全是非阻塞入队，唯一阻塞点是 ④——“计算不暂停”的保证在 Engine
-// 侧的三流事件环（cuda_engine.h）。
+// 主循环 run_loop 每拍五步：⓪ 抽干 stdin 收请求（read_line；ExitMsg /
+// EOF 结束循环）→ ① async_h2d → ② async_forward → ③ async_d2h →
+// ④ sync_recv。①②③ 对 Engine 是非阻塞入队；④ 是全循环唯一阻塞点——
+// 主机等在上一拍 D2H 落地的事件上，这一等本身就是节拍器（节拍滞后一拍，
+// 即 overlap）。“计算不暂停”的保证在 Engine 侧的三流事件环
+// （cuda_engine.h）。
 // ===========================================================================
 #pragma once
 

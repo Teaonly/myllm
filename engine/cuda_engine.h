@@ -3,7 +3,8 @@
 // ===========================================================================
 //
 // 四个方法与基类一一对应，调用方是 Scheduler::run_loop（scheduler.cpp），
-// 每拍顺序 prepare 前置一次，然后 async_h2d → async_forward → sync_d2h。
+// 每拍顺序 prepare 前置一次，然后 async_h2d → async_forward → async_d2h →
+// sync_recv。
 //
 // 内部结构（后续步骤逐步长出，先在此立位，见 overlap.md / cache.md）：
 //   - 三条流：主计算流 + H2D / D2H 两条独立拷贝流，跨流用 cudaEvent 接力；
@@ -54,18 +55,20 @@ private:
     // 事件 = 跨流 / 流-主机的接力点，方向即数据依赖方向。三个事件名各为
     // ping-pong ×2 数组，下标 = fifo 槽位（与 fifo 同深的事件环）：
     //   h2d_done_     h2d_stream 录 → compute_stream 等待（同拍）：输入到位；
-    //   compute_done_ compute_stream 录 → d2h_stream 等待（上一拍）：结果出炉；
-    //   d2h_done_     d2h_stream 录 → 主机 cudaEventSynchronize（上一拍结果
-    //                落地）——阻塞即节拍器（唯一的同步点，待补）。
-    // 为什么必须 ×2：sync_d2h 等“上一拍”的 compute_done_，而“本拍”的
-    // record 已在 async_forward 里覆盖了单一事件——record 在前、跨拍等待
-    // 在后，快照语义救不了串拍。每槽各持一个事件，等最旧与录最新互不干扰。
+    //   compute_done_ compute_stream 录 → d2h_stream 等待（同拍）：本拍结果
+    //                出炉，拷贝立即接力、不滞后一拍；
+    //   d2h_done_     d2h_stream 录 → ④ 主机 cudaEventSynchronize（上一拍
+    //                结果落地）——阻塞即节拍器，全循环唯一同步点。
+    // 为什么 ×2：真正跨拍的等待只有一处——④ sync_recv 等上一拍的 d2h_done_，
+    // 而本拍 ③ 的 record 已把单一事件覆盖，快照语义救不了这种串拍；两个槽，
+    // 等最旧与录最新互不干扰。①②、②③ 的接力都在拍内（record 先于 wait
+    // 入队），单事件本可胜任——三事件统一 ×2 取环对称、免特例。
     cudaEvent_t h2d_done_[2] = {nullptr, nullptr};
     cudaEvent_t compute_done_[2] = {nullptr, nullptr};
     cudaEvent_t d2h_done_[2] = {nullptr, nullptr};
 
-    // 当前拍的槽位（0/1 交替）：本拍写入 [ping_]，sync_d2h 消费 [ping_^1]，
-    // 拍末翻转。
+    // 当前拍的槽位（0/1 交替）：本拍 ①②③ 全用 [ping_]，④ sync_recv 消费
+    // [ping_^1]，拍末翻转。
     int ping_ = 0;
 };
 
