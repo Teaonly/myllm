@@ -89,7 +89,11 @@ void Scheduler::run_loop(Engine& engine) {
     //    bug 处理：记 stderr、跳过该行、继续收。
     auto status = read_line(line, 1);
     while (status == ReadStatus::Line) {
+      // 行级原子性（protocol.cpp 契约）：一行全有或全无——decode_line 失败
+      // 前可能已把半截 Batch 的好消息 append 进来，整行回滚丢弃。
+      size_t before = reqs.size();
       if (!decode_line(line, reqs, err)) {
+        reqs.resize(before);
         std::cerr << "decode_line failed: " << err << std::endl;
       }
       status = read_line(line, 0);
