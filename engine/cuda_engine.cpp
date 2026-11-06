@@ -31,7 +31,7 @@ void CudaEngine::prepare() {
     ck(cudaEventRecord(d2h_done_[1], d2h_stream_));
     
 
-    // TODO(后续)：分配 Cache 显存（cache.md）、加载 bf16 权重、CUDA Graph。
+    // TODO(后续)：分配 Cache 显存、加载 bf16 权重、CUDA Graph。
 }
 
 CudaEngine::~CudaEngine() {

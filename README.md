@@ -7,8 +7,7 @@
 - [docs/model.md](docs/model.md) — 模型架构说明，含为什么自己写
 - [docs/architecture.md](docs/architecture.md) — 前后端职责与协议入口
 - [docs/protocol.md](docs/protocol.md) — 数据交互定义，复用 mini-sglang 消息设计
-- [docs/cache.md](docs/cache.md) — Cache 模块设计：对等双流、准入路由与前缀语义
-- [docs/overlap.md](docs/overlap.md) — Overlap 调度设计：单循环滞后一批、乐观推进、token 池 GPU 闭环（研读 mini-sglang）
+- [docs/overlap.md](docs/overlap.md) — Overlap 调度设计：双节拍——入队与收货错开一拍，计算不暂停
 
 ## 第三方参考实现
 

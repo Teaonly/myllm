@@ -6,7 +6,7 @@
 
 ## 职责
 
-- **前端（HTTP API）**：面向客户端的 HTTP 服务，负责请求解析、tokenize / detokenize、会话组装（多轮历史全量并入 input_ids）、API 方言与流式输出（SSE / chunked）；不碰 GPU，也不做并发准入——它不知道缓存的存在，一切容量问题通过 ErrorMsg 感知（[cache.md](cache.md) §5）。
+- **前端（HTTP API）**：面向客户端的 HTTP 服务，负责请求解析、tokenize / detokenize、会话组装（多轮历史全量并入 input_ids）、API 方言与流式输出（SSE / chunked）；不碰 GPU，也不做并发准入——它不知道缓存的存在，一切容量问题通过 ErrorMsg 感知。
 - **后端（GPU 推理进程）**：加载模型，专注 prefill/decode 计算；不做网络 IO。**不用 Python 开发**，仓库内所有 Python 代码只存在于 frontend/；协议（[protocol.md](protocol.md)）是两侧唯一的共享契约，各自语言实现编解码。
 - **交互**：前端把请求写进后端的 stdin，后端逐 token 写回 stdout。两个独立进程，边界即模块边界。
 
@@ -18,7 +18,7 @@
 
 ## 协议
 
-交互契约（消息、时序、不变量）见 [protocol.md](protocol.md)。要点：NDJSON 文本，不使用 msgpack / pickle / 任何二进制序列化；stdout 只放协议数据；引擎进程常驻（模型加载是分钟级）。并发由后端准入：对等双流（[cache.md](cache.md)），满载即拒（`ErrorMsg code=busy`），重试交给客户端 SDK——后端不排队，前端不排队。
+交互契约（消息、时序、不变量）见 [protocol.md](protocol.md)。要点：NDJSON 文本，不使用 msgpack / pickle / 任何二进制序列化；stdout 只放协议数据；引擎进程常驻（模型加载是分钟级）。并发由后端准入：对等双流，满载即拒（`ErrorMsg code=busy`），重试交给客户端 SDK——后端不排队，前端不排队。
 
 ## 前端技术选型（2026-10）
 
@@ -36,11 +36,19 @@
 
 每次调度循环，D2H 拿到数据是 fifo 最"旧"的数据，节拍上滞后的，这样就可以实现所谓 Overlap 了。
 
-### Scheduler 是后端的核心架构主体
+### Scheduler：进程主体，但刻意做薄——只做协议翻转
 
-负责和前端的交付，处理 STDIN / STDOUT 的读写，按照 NDJOSN 进行协议解析。
-核心是 Overlap 循环，每次循环完成一次 H2D 写入， D2H 的读取，以及 STDIN 新数据的查询。
+Scheduler 拥有进程与主循环，但设计上是一个很薄的协议翻转层，只负责 STDIN / STDOUT 的
+读写：读侧把 NDJSON 行解码成 Inbound 对象，写侧把 Outbound 编码回协议行；外加 overlap
+循环的时钟（每拍 ⓪ 抽干 stdin 收消息 → ① async_h2d → ② async_forward → ③ async_d2h
+→ ④ sync_recv，全循环唯一阻塞点在 ④）。
 
-### Engine 是计算的抽象类
+它不做任何计算侧决策：不组步、不准入、不区分请求类型——所有 Inbound 原样压入 Engine
+（AbortMsg 同通道）。ExitMsg / EOF 是进程生命周期信号，在 ⓪ 上游拦截，到不了 Engine。
 
-完成具体的计算，完成Prefill/decode 状态管理，管理 Cache 内存等工作。
+### Engine：计算的自治单元
+
+计算抽象类，收整个请求、内部自治：prefill / decode 状态管理、Cache 显存、准入
+（busy / 超长）、双流路由全部在里面——对等双流是 Engine 的
+局部设置，wire 协议不感知。接口每拍四段（async_h2d / async_forward / async_d2h /
+sync_recv），测试挂假 Engine 即可驱动 Scheduler 的全部协议行为。

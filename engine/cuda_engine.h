@@ -6,12 +6,12 @@
 // 每拍顺序 prepare 前置一次，然后 async_h2d → async_forward → async_d2h →
 // sync_recv。
 //
-// 内部结构（后续步骤逐步长出，先在此立位，见 overlap.md / cache.md）：
+// 内部结构（后续步骤逐步长出，先在此立位，见 overlap.md）：
 //   - 三条流：主计算流 + H2D / D2H 两条独立拷贝流，跨流用 cudaEvent 接力；
 //   - input / output 双 fifo（各 ≥2 深）——output 每拍取最旧一步，节拍
 //     滞后一步，即 overlap 的本体；
 //   - 请求状态与 prefill / decode 状态机（Engine 自治，接口不感知）；
-//   - Cache 显存（cache.md：双流固定 KV、LCP 准入）。
+//   - Cache 显存（设计重做中）。
 //
 // 当前状态：已引入 <cuda_runtime.h>，三流 + 事件 ping-pong ×2 成员立位
 // （创建在 prepare()，销毁随析构）；kernel / Cache 显存随对应步骤进入。
