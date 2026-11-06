@@ -211,6 +211,107 @@ constexpr int PLE_CONV_STATE_ELEMS = PLE_CONV_STATE_LEN * HC_DIM;    // 92'160
 // 内存压力在权重(全 bf16 ≈335GiB,两级驻留是后续步骤)。
 
 // ---------------------------------------------------------------------------
+// §11 权重访问虚类:WeightStore —— (层号, 枚举) → 张量裸指针
+// ---------------------------------------------------------------------------
+//
+// 角色:QFN 权重的抽象存放处。三个事实钉死接口形状:
+//   1. checkpoint 键 = 层前缀 + 固定后缀。1658 键全量分类实测(写作时,
+//      model.safetensors.index.json):归一化后恰 48 种后缀、零例外——所以
+//      (layer, kind) 二元组足够唯一定位张量;唯一例外是 n-gram 巨表同后缀
+//      ×128 片,加一个 shard 实参;
+//   2. 返回 void* 指向张量原始字节,dtype 跟随 checkpoint 张量本身(绝大多数
+//      bf16,见头注数值契约;ple 的三个 n-gram 参数 buffer 是整型哈希量,
+//      与 §6 已钉死的 LAYER_MULT / HEAD_OFFSETS / HEAD_SIZES 同数值)。
+//      维度由 kind 决定,调用方按 §1–§7 自知,接口不传 shape;
+//   3. 权重 ~335GiB > 显存——两级驻留是后续步骤,所以接口不承诺指针落在
+//      显存还是 host 内存,由实现决定;调用方按需 H2D 或直接喂 kernel。
+//
+// 契约:
+//   - layer ∈ [0, N_LAYERS):层权重;LAYER_NONE:非层权重(枚举最后 5 项);
+//   - 该层不存在该张量(GDN 层要 self_attn.*、非 PLE_LAYER 层要 ple.*、
+//     层枚举配 LAYER_NONE 等)返回 nullptr,不抛异常;
+//   - 指针归实现所有:调用方不释放、不跨拍缓存(两级驻留的实现会搬移)。
+//   - 刻意不进枚举:vision tower(text-only,同头注);MTP 的 8 张量(§9,
+//     投机解码步骤接入时再扩)。
+// ---------------------------------------------------------------------------
+
+constexpr int LAYER_NONE = -1;  // 非层权重(embed / lm_head / 顶层 mixer)的层号占位
+
+// 枚举值 = 归一化 checkpoint 键名(去层号、去 .weight 尾)的 PascalCase;
+// 行尾注释保留键名原文,逐项可与 index.json 对照。按"哪类层拥有"分组,
+// 单层的合法子集由 is_full_attention_layer() / PLE_LAYER 决定。
+enum class WeightKind {
+    // --- linear_attn.*:GDN 层独有(36 层) ---
+    LinearAttnInProjQkv,   // linear_attn.in_proj_qkv.weight
+    LinearAttnInProjZ,     // linear_attn.in_proj_z.weight
+    LinearAttnInProjA,     // linear_attn.in_proj_a.weight
+    LinearAttnInProjB,     // linear_attn.in_proj_b.weight
+    LinearAttnConv1d,      // linear_attn.conv1d.weight
+    LinearAttnALog,        // linear_attn.A_log
+    LinearAttnDtBias,      // linear_attn.dt_bias
+    LinearAttnNorm,        // linear_attn.norm.weight
+    LinearAttnOutProj,     // linear_attn.out_proj.weight
+
+    // --- self_attn.*:全注意力层独有(12 层) ---
+    SelfAttnQProj,         // self_attn.q_proj.weight
+    SelfAttnKProj,         // self_attn.k_proj.weight
+    SelfAttnVProj,         // self_attn.v_proj.weight
+    SelfAttnOProj,         // self_attn.o_proj.weight
+    SelfAttnQNorm,         // self_attn.q_norm.weight
+    SelfAttnKNorm,         // self_attn.k_norm.weight
+    IndexerQkProj,         // self_attn.indexer.index_qk_proj.weight
+    IndexerQNorm,          // self_attn.indexer.q_layernorm.weight
+    IndexerKNorm,          // self_attn.indexer.k_layernorm.weight
+
+    // --- mlp.*:MoE,全部 48 层 ---
+    MoeGate,               // mlp.gate.weight(路由器)
+    MoeExpertsGateUp,      // mlp.experts.gate_up_proj(512 专家打平的巨张量,键无 .weight 尾)
+    MoeExpertsDown,        // mlp.experts.down_proj(同上)
+    SharedExpertGateProj,  // mlp.shared_expert.gate_proj.weight
+    SharedExpertUpProj,    // mlp.shared_expert.up_proj.weight
+    SharedExpertDownProj,  // mlp.shared_expert.down_proj.weight
+    SharedExpertGate,      // mlp.shared_expert_gate.weight(共享专家出口的标量门)
+
+    // --- {attn,mlp}_hyper_connection.*:全部 48 层,attn 与 mlp 两处各 4 张量 ---
+    AttnHcInject,          // attn_hyper_connection.block_inject_weight.weight
+    AttnHcNorm,            // attn_hyper_connection.hc_norm.weight
+    AttnHcMixDown,         // attn_hyper_connection.input_mix_weight_down.weight
+    AttnHcMixUp,           // attn_hyper_connection.input_mix_weight_up.weight
+    MlpHcInject,           // mlp_hyper_connection.block_inject_weight.weight
+    MlpHcNorm,             // mlp_hyper_connection.hc_norm.weight
+    MlpHcMixDown,          // mlp_hyper_connection.input_mix_weight_down.weight
+    MlpHcMixUp,            // mlp_hyper_connection.input_mix_weight_up.weight
+
+    // --- ple.*:仅 PLE_LAYER 层 ---
+    PleConv1d,             // ple.conv1d.weight
+    PleKeyProj,            // ple.key_proj.weight
+    PleValueProj,          // ple.value_proj.weight
+    PleNormConv,           // ple.norm_conv.weight
+    PleNormKey,            // ple.norm_key.weight
+    PleNormQuery,          // ple.norm_query.weight
+    PleLayerMultipliers,   // ple.ple_embedding.layer_multipliers
+    PleHeadOffsets,        // ple.ple_embedding.ngram_heads_offsets
+    PleHeadSizes,          // ple.ple_embedding.ngram_heads_vocab_sizes
+    PleNgramShard,         // ple.ple_embedding.ngram_embedding.shard_{0..127}.weight(配 shard 实参)
+
+    // --- 非层权重(layer = LAYER_NONE) ---
+    EmbedTokens,           // model.language_model.embed_tokens.weight
+    LmHead,                // lm_head.weight(TIE_WORD_EMBEDDINGS=false,独立张量)
+    MixerHcNorm,           // hyper_connection_mixer.hc_norm.weight(顶层 mixer,兼最终 norm)
+    MixerMixDown,          // hyper_connection_mixer.input_mix_weight_down.weight
+    MixerMixUp,            // hyper_connection_mixer.input_mix_weight_up.weight
+};
+
+class WeightStore {
+public:
+    virtual ~WeightStore() = default;
+
+    // (layer, kind) → 该张量数据的裸指针,契约见上。shard 仅在
+    // kind == PleNgramShard 时有意义([0, NGRAM_SHARDS)),其余 kind 忽略。
+    virtual void* weight(int layer, WeightKind kind, int shard = -1) = 0;
+};
+
+// ---------------------------------------------------------------------------
 // 编译期自检:常量表若与速查表/官方 config 抄错,这里直接编不过。
 // ---------------------------------------------------------------------------
 
