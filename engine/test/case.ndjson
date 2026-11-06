@@ -1,0 +1,4 @@
+{"__type__":"UserMsg","uid":1,"input_ids":[248044,9707,11],"sampling_params":{"max_tokens":8}}
+{"__type__":"UserMsg","uid":2,"input_ids":[9707,11,1879]}
+{"__type__":"AbortBackendMsg","uid":2}
+{"__type__":"BatchBackendMsg","data":[{"__type__":"UserMsg","uid":3,"input_ids":[11,872],"sampling_params":{"max_tokens":4}}]}
