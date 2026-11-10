@@ -1,6 +1,9 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <fstream>
+#include <iostream>
+#include <sstream>
 #include <string>
 
 #include "vt/vt_cuda.hpp"
@@ -20,18 +23,30 @@ int main(int argc, char** argv) {
     // 1. global vt stuff
     CudaEnv* env = build_vt_cuda();    // 词表（cuda.* + gguf.* 等）在出厂时装全
 
-    // 2. 冒烟：DSL 文本 → 栈机 → CUDA 资源池 → 设备显存块
-    //    流 = default stream 隐式模型：计算词不带流号，set_stream 换 default
-    env->execute("4096 cuda.alloc ?");                    // dev=0 0x7f... 4096B
-    env->execute("1 cuda.set_stream 8192 cuda.alloc cuda.zeros ?");  // 换 default，分配并清零
-    env->execute("cuda.sync 0 cuda.set_stream");          // 排空 default，换回 0 号
-
-    // 3. GGUF 加载：./build/engine <file.gguf> <tensor-name>
-    //    原始字节 → CudaTensor，打印显存块描述符
-    if (argc == 3) {
-        env->execute("'" + std::string(argv[1]) + "' '" + argv[2] + "' gguf.load ?");
-        env->execute("cuda.sync");
+    // 2. 装载剧本：模型路径写在剧本头部，逐张量 gguf.load → hash（Strata
+    //    内存模型：embedding/PLE/MOE 大块不装，名单与层布局见剧本头注释）
+    std::ifstream vf("qwen3.8-next.vt");
+    if (!vf) {
+        std::cerr << "can't open qwen3.8-next.vt (run from engine/)" << std::endl;
+        return 1;
     }
+    std::stringstream ss;
+    ss << vf.rdbuf();
+    env->execute(ss.str());
 
+    // 3. command loop：逐行读 vt 指令执行（Ctrl-D 或 ^ 退出）
+    std::cout << "vt command loop: Ctrl-D 退出" << std::endl;
+    std::string line;
+    while (true) {
+        std::cout << "vt> " << std::flush;
+        if (!std::getline(std::cin, line)) {
+            std::cout << std::endl;
+            break;
+        }
+        if (line.find_first_not_of(" \t") == std::string::npos) {
+            continue;    // 空行：直接回到提示符
+        }
+        env->execute(line);
+    }
     return 0;
 }
