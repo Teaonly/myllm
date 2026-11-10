@@ -1,0 +1,330 @@
+; ============================================================================
+; qwen3.8-next.vt —— Qwen3.8-Flash-Next 常驻小权重装载剧本（vt DSL）
+;
+; main 直接加载本剧本，装完进入 command loop 逐行执行 vt 指令（REPL）。
+;
+; 内存模型参照 Strata run-iq3_s.sh：小权重（attention/ssm/超连接/共享专家/
+; 路由/output_hc）全数常驻显存；大块不装，留给后续按需路径——
+;     token_embd.weight / output.weight   embedding/解嵌入（词表 248320）
+;     blk.1.ple_*                         PLE 投影（6 个）
+;     per_layer_token_embd.weight         PLE 巨表 28.8GB（在 00002 分片）
+;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3）
+;
+; 装载模式（路径常驻栈底，逐张量复用）：
+;     '名字' dup2 gguf.load swap !
+;   dup2                ( path name -- path name path name )
+;   gguf.load 吃一份    ( path name -- tensor )
+;   swap !              ( tensor name -- ) 存进 hash；path 留栈
+; 装完 drop 掉路径。合计 1071 个 =
+;   3 顶层 output_hc + 48 层 × 13 公共 + 36 GDN 层 × 9 + 12 全注意力层 × 10
+; ============================================================================
+
+; ---- 模型路径（文件头直接设定；dup 一份进 hash 留档，REPL 里 'model.gguf' @ 随取）----
+'/home/teaonly/workspace/models/qwen3.8-flash-gsq/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf' dup 'model.gguf' !
+
+; ---- 顶层 output_hc（3 个）----
+'output_hc_down.weight'  dup2 gguf.load swap !
+'output_hc_norm.weight'  dup2 gguf.load swap !
+'output_hc_up.weight'    dup2 gguf.load swap !
+
+; ---- 48 层公共：FFN 共享专家 + 路由 + 超连接（13 个/层）----
+%for 0 47
+'blk.%%.ffn_down_shexp.weight'     dup2 gguf.load swap !
+'blk.%%.ffn_gate_inp.weight'       dup2 gguf.load swap !
+'blk.%%.ffn_gate_inp_shexp.weight' dup2 gguf.load swap !
+'blk.%%.ffn_gate_shexp.weight'     dup2 gguf.load swap !
+'blk.%%.ffn_up_shexp.weight'       dup2 gguf.load swap !
+'blk.%%.hc_attn_down.weight'       dup2 gguf.load swap !
+'blk.%%.hc_attn_inject.weight'     dup2 gguf.load swap !
+'blk.%%.hc_attn_norm.weight'       dup2 gguf.load swap !
+'blk.%%.hc_attn_up.weight'         dup2 gguf.load swap !
+'blk.%%.hc_ffn_down.weight'        dup2 gguf.load swap !
+'blk.%%.hc_ffn_inject.weight'      dup2 gguf.load swap !
+'blk.%%.hc_ffn_norm.weight'        dup2 gguf.load swap !
+'blk.%%.hc_ffn_up.weight'          dup2 gguf.load swap !
+%endf
+
+; ---- GDN 线性注意力层（36 层）：attn_gate/qkv + ssm 全家（9 个/层）----
+%for 0 2
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 4 6
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 8 10
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 12 14
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 16 18
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 20 22
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 24 26
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 28 30
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 32 34
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 36 38
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 40 42
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+%for 44 46
+'blk.%%.attn_gate.weight'   dup2 gguf.load swap !
+'blk.%%.attn_qkv.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_a'              dup2 gguf.load swap !
+'blk.%%.ssm_alpha.weight'   dup2 gguf.load swap !
+'blk.%%.ssm_beta.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_conv1d.weight'  dup2 gguf.load swap !
+'blk.%%.ssm_dt.bias'        dup2 gguf.load swap !
+'blk.%%.ssm_norm.weight'    dup2 gguf.load swap !
+'blk.%%.ssm_out.weight'     dup2 gguf.load swap !
+%endf
+
+; ---- 全注意力层（(层号+1)%4==0，12 层）：attn_q/k/v/output + indexer（10 个/层）----
+%for 3 3
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 7 7
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 11 11
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 15 15
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 19 19
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 23 23
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 27 27
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 31 31
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 35 35
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 39 39
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 43 43
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+%for 47 47
+'blk.%%.attn_k.weight'         dup2 gguf.load swap !
+'blk.%%.attn_k_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_output.weight'    dup2 gguf.load swap !
+'blk.%%.attn_q.weight'         dup2 gguf.load swap !
+'blk.%%.attn_q_norm.weight'    dup2 gguf.load swap !
+'blk.%%.attn_v.weight'         dup2 gguf.load swap !
+'blk.%%.indexer.k_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.k_proj.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_norm.weight' dup2 gguf.load swap !
+'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
+%endf
+
+; ---- 收尾：路径出栈，排空 H2D，报个到 ----
+drop
+cuda.sync
+'qwen3.8-next loaded: 1071 dense weights resident' ?

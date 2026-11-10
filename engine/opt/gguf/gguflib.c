@@ -287,7 +287,10 @@ int gguf_get_tensor(gguf_ctx *ctx, gguf_tensor *tensor) {
         }
     }
     uint32_t *type = (uint32_t*) (ctx->data+ctx->off);
-    if (*type >= GGUF_TYPE_COUNT) return 0;
+    /* Local change: unknown type IDs no longer end the iteration. GSQ-RCO
+     * files use a custom expert type (42) in the middle of the tensor list;
+     * bailing out here made every tensor after it invisible. Unknown types
+     * get bsize 0 below - callers skip what they can't size. */
     ctx->off += 4;  // Skip tensor type.
     tensor->type = *type;
 
@@ -306,6 +309,10 @@ int gguf_get_tensor(gguf_ctx *ctx, gguf_tensor *tensor) {
      * multiply by the block size to obtain the final total size. */
     struct gguf_tensor_type_features *tf;
     tf = gguf_get_tensor_type_features(tensor->type);
+    if (tf == NULL) {           /* Unknown type: no block layout, no size. */
+        tensor->bsize = 0;
+        return 1;
+    }
     uint64_t weights_padding = gguf_get_alignment_padding(tf->items_per_block,tensor->num_weights);
     tensor->bsize = ((tensor->num_weights+weights_padding) / tf->items_per_block) * tf->bytes_per_block;
     return 1;
