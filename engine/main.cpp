@@ -16,6 +16,24 @@ void init(){
     ::sigaction(SIGPIPE, &sa, nullptr);
 }
 
+// 临时调试用：逐行读 vt 指令执行的 command loop（Ctrl-D 或 ^ 退出），
+// 引擎真正的服务循环落地后由其替代
+void debug_command_loop(CudaEnv* env) {
+    std::cout << "vt command loop: Ctrl-D 退出" << std::endl;
+    std::string line;
+    while (true) {
+        std::cout << "vt> " << std::flush;
+        if (!std::getline(std::cin, line)) {
+            std::cout << std::endl;
+            break;
+        }
+        if (line.find_first_not_of(" \t") == std::string::npos) {
+            continue;    // 空行：直接回到提示符
+        }
+        env->execute(line);
+    }
+}
+
 int main(int argc, char** argv) {
     // 0. init
     init();
@@ -34,19 +52,7 @@ int main(int argc, char** argv) {
     ss << vf.rdbuf();
     env->execute(ss.str());
 
-    // 3. command loop：逐行读 vt 指令执行（Ctrl-D 或 ^ 退出）
-    std::cout << "vt command loop: Ctrl-D 退出" << std::endl;
-    std::string line;
-    while (true) {
-        std::cout << "vt> " << std::flush;
-        if (!std::getline(std::cin, line)) {
-            std::cout << std::endl;
-            break;
-        }
-        if (line.find_first_not_of(" \t") == std::string::npos) {
-            continue;    // 空行：直接回到提示符
-        }
-        env->execute(line);
-    }
+    // 3. 临时：command loop 调试
+    debug_command_loop(env);
     return 0;
 }
