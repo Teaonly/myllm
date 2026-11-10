@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "vt_cuda.hpp"
+#include "vt_gguf.hpp"
 
 // ---------------------------------------------------------------------------
 // 1. CudaContext —— 打开一台设备，建好流与事件的池子，常驻到析构
@@ -157,9 +158,13 @@ CudaEnv* build_vt_cuda() {
     static CudaContext ctx(0, 2, 2);    // 设备/流数/事件数：最终拓扑定案时改这里
     auto* env = new CudaEnv(&ctx);
 
+    // CUDA 层词表
     env->insert_native_word("cuda.alloc",       AllocWord::creator);
     env->insert_native_word("cuda.zeros",       ZerosWord::creator);
     env->insert_native_word("cuda.set_stream",  SetStreamWord::creator);
     env->insert_native_word("cuda.sync",        SyncWord::creator);
+
+    // 其他层的词表也在这统统装上：一次 build_vt_cuda 拿到完整词表
+    register_gguf_words(*env);
     return env;
 }

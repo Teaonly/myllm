@@ -64,6 +64,7 @@ struct CudaTensor : vt::TensorType {
 };
 
 // ---------------------------------------------------------------------------
-// 组装出厂：new 一个 Enviroment<CudaTensor, CudaContext> 并注册 CUDA native 词。
+// 组装出厂：new 一个 Enviroment<CudaTensor, CudaContext>，注册 CUDA native 词，
+// 并把其他层（gguf 等）的词表也统统装上——一次调用拿到完整词表的 env。
 using CudaEnv = vt::Enviroment<CudaTensor, CudaContext>;
 CudaEnv* build_vt_cuda();       // 进程级单例：env/ctx 不 delete，随进程回收

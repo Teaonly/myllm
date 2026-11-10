@@ -4,7 +4,6 @@
 #include <string>
 
 #include "vt/vt_cuda.hpp"
-#include "vt/vt_gguf.hpp"
 
 void init(){
     struct sigaction sa;
@@ -19,8 +18,7 @@ int main(int argc, char** argv) {
     init();
 
     // 1. global vt stuff
-    CudaEnv* env = build_vt_cuda();
-    register_gguf_words(*env);
+    CudaEnv* env = build_vt_cuda();    // 词表（cuda.* + gguf.* 等）在出厂时装全
 
     // 2. 冒烟：DSL 文本 → 栈机 → CUDA 资源池 → 设备显存块
     //    流 = default stream 隐式模型：计算词不带流号，set_stream 换 default
