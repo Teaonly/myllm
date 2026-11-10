@@ -3,7 +3,7 @@
 // 阅读顺序即数据流顺序：
 //   1. CudaContext    资源池：设备 + 流 + 事件
 //   2. CudaTensor     显存块：分配 / 释放 / 打印
-//   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / cuda.set_stream / cuda.sync）
+//   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / cuda.zeros / cuda.set_stream / cuda.sync）
 //   4. build_vt_cuda  组装出厂
 
 #include <sstream>
@@ -119,6 +119,23 @@ struct SyncWord : vt::NativeWord<CudaTensor> {
     }
 };
 
+// cuda.zeros：( tensor -- tensor ) 用 0 填充目标地址（字节级，无 dtype）
+struct ZerosWord : vt::NativeWord<CudaTensor> {
+    CudaContext* ctx_;
+    ZerosWord(CudaEnv& env) : ctx_(env.ctx()) {}
+    static vt::NativeWord<CudaTensor>* creator(CudaEnv& env) { return new ZerosWord(env); }
+
+    void run(vt::Stack<CudaTensor>& stack) override {
+        auto t = stack.pop_tensor();
+        if (t->size_ > 0) {
+            if (cudaMemsetAsync(t->data_, 0, t->size_, ctx_->cur_stream()) != cudaSuccess) {
+                vt_panic("cuda.zeros: cudaMemsetAsync failed");
+            }
+        }
+        stack.push_tensor(t);
+    }
+};
+
 // cuda.set_stream：( i -- ) 设"当前工作流"——之后的计算词都发射到这条流
 struct SetStreamWord : vt::NativeWord<CudaTensor> {
     CudaContext* ctx_;
@@ -141,6 +158,7 @@ CudaEnv* build_vt_cuda() {
     auto* env = new CudaEnv(&ctx);
 
     env->insert_native_word("cuda.alloc",       AllocWord::creator);
+    env->insert_native_word("cuda.zeros",       ZerosWord::creator);
     env->insert_native_word("cuda.set_stream",  SetStreamWord::creator);
     env->insert_native_word("cuda.sync",        SyncWord::creator);
     return env;

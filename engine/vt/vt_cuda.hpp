@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "opt/vt/vt.hpp"
+#include "vt.hpp"
 
 #include <cuda_runtime.h>
 
