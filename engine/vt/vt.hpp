@@ -288,7 +288,7 @@ struct Hash {
 
     Item find(const std::string& name) {
         if ( map_.find(name) == map_.end() ) {
-            std::cout << "Find: " << name << std::endl;
+            std::cerr << "Find: " << name << std::endl;
             vt_panic("Can't find value for name!");
         }
         return map_[name];
@@ -749,7 +749,7 @@ namespace base {
     template <typename TensorT, typename ContextT>
     struct Dump : public NativeWord<TensorT> {
         void run(Stack<TensorT>& stack) override {
-            std::cout << stack << std::endl;
+            std::cerr << stack << std::endl;
         }
         NWORD_CREATOR_DEFINE_LR(Dump)
     };
@@ -758,7 +758,7 @@ namespace base {
     struct Echo : public NativeWord<TensorT> {
         void run(Stack<TensorT>& stack) override {
             Cell<TensorT> cell = stack.pop();
-            std::cout << cell << std::endl;
+            std::cerr << cell << std::endl;
         }
         NWORD_CREATOR_DEFINE_LR(Echo)
     };
@@ -1229,7 +1229,7 @@ UserWord Enviroment<TensorT, ContextT>::compile(const std::string& txt) {
         } else if ( user_words_.find( token ) != user_words_.end() ) {
             newCode = WordCode::new_user( token );
         } else {
-            std::cout << token << std::endl;
+            std::cerr << token << std::endl;
             vt_panic("Find an invalid symbol is not string, number, builtin, user or native!");
         }
 
