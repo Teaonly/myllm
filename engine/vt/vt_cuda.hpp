@@ -47,15 +47,22 @@ private:
 
 // ---------------------------------------------------------------------------
 // TensorT —— 设备显存块（vt 的栈 cell 装的就是 shared_ptr<CudaTensor>）。
-// 三个字段构造即定型：data_ 是 const 指针（指针不变、内容可写），
+// 字段构造即定型：data_ 是 const 指针（指针不变、内容可写），
 // kernel 侧拿去 cast 成目标类型直接用。
+// 两种身世：真身（cudaMalloc 所得、析构 cudaFree）与 view（在真身显存上
+// 偏移切片，不拥有显存、析构不释放）。owner_ 钉住真身的生命周期：
+// view 活着真身就不会被释放，借来的地址永远有效，内存保证不出错。
 struct CudaTensor : vt::TensorType {
     const size_t size_;       // 设备上的字节数
-    void* const  data_;       // 设备指针（cudaMalloc 所得）
+    void* const  data_;       // 设备指针（真身=cudaMalloc；view=真身+偏移）
     const int    device_;     // 所在设备号
+    const bool   view_ = false;   // 标识：view 是借来的显存，析构不 cudaFree
+    const std::shared_ptr<CudaTensor> owner_ = nullptr;  // view 借谁的显存（钉住真身生命周期）
 
-    // 构造即在指定设备上分配 dev_size 字节（内容未初始化）；析构 cudaFree
+    // 真身：构造即在指定设备上分配 dev_size 字节（内容未初始化）；析构 cudaFree
     CudaTensor(int dev, size_t dev_size);
+    // view：不分配，在真身显存上偏移 offset 切 view_size 字节
+    CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t view_size);
     ~CudaTensor() override;
 
     // vt 唯一接口要求（Echo "?" / Dump "??" 打印 cell 用）：

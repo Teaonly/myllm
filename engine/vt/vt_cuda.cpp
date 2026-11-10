@@ -74,8 +74,18 @@ CudaTensor::CudaTensor(int dev, size_t dev_size)
     : size_(dev_size), data_(dev_alloc(dev, dev_size)), device_(dev) {
 }
 
+CudaTensor::CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t view_size)
+    : size_(view_size),
+      data_((char*)owner->data_ + offset),
+      device_(owner->device_),
+      view_(true),
+      // 视图的视图也扁平指向真身：owner 链永远只有一层
+      owner_(owner->view_ ? owner->owner_ : owner) {
+}
+
 CudaTensor::~CudaTensor() {
-    if (data_ != nullptr) {
+    // view 不拥有显存：真身由自己的栈生命周期负责释放
+    if (!view_ && data_ != nullptr) {
         cudaSetDevice(device_);    // cudaFree 也作用于当前设备，先切回去
         cudaFree(data_);
     }
@@ -86,6 +96,7 @@ std::string CudaTensor::to_string() {
     os << "dev=" << device_
        << " 0x" << std::hex << (uintptr_t)data_ << std::dec
        << " " << size_ << "B";
+    if (view_) os << " [view]";
     return os.str();
 }
 
@@ -137,6 +148,26 @@ struct ZerosWord : vt::NativeWord<CudaTensor> {
     }
 };
 
+// cuda.view：( tensor offset size -- view ) 从已有显存块上偏移切一片。
+//   纯栈操作不碰 CUDA（不分配不拷贝），不需要 ctx，所以是 LR 形态。
+//   owner_ 钉住真身：view 活着真身就不会被释放，地址永远有效。
+//   越界即 panic：坏 view 会让后续写词踩到别人的显存
+struct ViewWord : vt::NativeWord<CudaTensor> {
+    static vt::NativeWord<CudaTensor>* creator(CudaEnv&) { return new ViewWord(); }
+
+    void run(vt::Stack<CudaTensor>& stack) override {
+        double n   = stack.pop_number();     // 栈顶：view 字节数
+        double o   = stack.pop_number();     // 中间：偏移
+        auto base  = stack.pop_tensor();     // 深层：真身（DSL 里先压）
+        vt_assert(o >= 0 && n >= 0 &&
+                      o == (double)(size_t)o && n == (double)(size_t)n,
+                  "cuda.view: offset/size must be non-negative integers");
+        vt_assert((size_t)o + (size_t)n <= base->size_,
+                  "cuda.view: view out of base tensor range");
+        stack.push_tensor(std::make_shared<CudaTensor>(base, (size_t)o, (size_t)n));
+    }
+};
+
 // cuda.set_stream：( i -- ) 设"当前工作流"——之后的计算词都发射到这条流
 struct SetStreamWord : vt::NativeWord<CudaTensor> {
     CudaContext* ctx_;
@@ -160,6 +191,7 @@ CudaEnv* build_vt_cuda() {
 
     // CUDA 层词表
     env->insert_native_word("cuda.alloc",       AllocWord::creator);
+    env->insert_native_word("cuda.view",        ViewWord::creator);
     env->insert_native_word("cuda.zeros",       ZerosWord::creator);
     env->insert_native_word("cuda.set_stream",  SetStreamWord::creator);
     env->insert_native_word("cuda.sync",        SyncWord::creator);
