@@ -53,13 +53,13 @@ inline void _M_Panic(const char* file, int line, const char* msg) {
 
 template <typename TensorT, typename ContextT> struct Enviroment;
 
-// TensorT 接口约束检测：须提供 to_string()（Echo/Dump 打印张量 cell 用）。
-// Enviroment 入口处 static_assert，违约时报在使用方声明那一行。
-template <typename T, typename = void>
-struct has_to_string : std::false_type {};
-
-template <typename T>
-struct has_to_string<T, std::void_t<decltype(std::declval<T&>().to_string())>> : std::true_type {};
+// TensorT 的接口基类：栈上张量类型须继承它并实现 to_string()（Echo/Dump 打印
+// 张量 cell 用）。选继承而非"探测成员是否存在"：重写即签名检查，返回类型也被
+// 钉死成 std::string；约束在 Enviroment 入口 static_assert（见下）把关。
+struct TensorType {
+    virtual std::string to_string() = 0;
+    virtual ~TensorType() {}     // 多态基类惯例：虚析构（vt 内不经基类指针 delete）
+};
 
 // target number type
 template <typename TensorT>
@@ -490,13 +490,14 @@ private:
 };
 
 // Enviroment 为模板类，两个类型均由使用方提供（vt 不定义默认类型）：
-//   TensorT  —— 栈上张量类型，唯一接口要求 to_string()（Echo/Dump 打印，
-//               下方 static_assert 编译期把关）
+//   TensorT  —— 栈上张量类型，须继承上面的 TensorType 并实现 to_string()
 //   ContextT —— 计算上下文，vt 只存指针透传，无接口要求
 template <typename TensorT, typename ContextT>
 struct Enviroment {
-    static_assert(has_to_string<TensorT>::value,
-                  "TensorT must provide to_string() (used by Echo/Dump to print tensor cell)");
+    // 接口把关：TensorT 不继承 TensorType 时，直接报在使用方声明那一行
+    static_assert(std::is_base_of_v<TensorType, TensorT>,
+                  "TensorT must inherit vt::TensorType (to_string() required by Echo/Dump)");
+
     Enviroment(ContextT* ctx);
     ~Enviroment() {
     }
