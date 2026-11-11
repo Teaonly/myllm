@@ -7,7 +7,6 @@
 //                     cuda.set_stream / cuda.sync）
 //   4. build_vt_cuda  组装出厂
 
-#include <cstring>
 #include <sstream>
 
 #include "vt_cuda.hpp"
@@ -172,7 +171,7 @@ struct SyncWord : vt::NativeWord<CudaTensor> {
 };
 
 // cuda.zeros：( tensor -- tensor ) 用 0 填充目标地址（字节级，无 dtype）。
-//   设备块走流异步；host 块是 CPU 内存，直接 memset（memset* 家族只认设备指针）
+//   只认设备显存：host 块不走 CUDA 清零路径，碰上即报错
 struct ZerosWord : vt::NativeWord<CudaTensor> {
     CudaContext* ctx_;
     ZerosWord(CudaEnv& env) : ctx_(env.ctx()) {}
@@ -180,10 +179,9 @@ struct ZerosWord : vt::NativeWord<CudaTensor> {
 
     void run(vt::Stack<CudaTensor>& stack) override {
         auto t = stack.pop_tensor();
+        vt_assert(!t->host_, "cuda.zeros: device memory only (host tensor)");
         if (t->size_ > 0) {
-            if (t->host_) {
-                memset(t->data_, 0, t->size_);
-            } else if (cudaMemsetAsync(t->data_, 0, t->size_, ctx_->cur_stream()) != cudaSuccess) {
+            if (cudaMemsetAsync(t->data_, 0, t->size_, ctx_->cur_stream()) != cudaSuccess) {
                 vt_panic("cuda.zeros: cudaMemsetAsync failed");
             }
         }
