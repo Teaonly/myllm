@@ -3,9 +3,11 @@
 // 阅读顺序即数据流顺序：
 //   1. CudaContext    资源池：设备 + 流 + 事件
 //   2. CudaTensor     显存块：分配 / 释放 / 打印
-//   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / cuda.zeros / cuda.set_stream / cuda.sync）
+//   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / host.alloc / cuda.view / cuda.zeros /
+//                     cuda.set_stream / cuda.sync）
 //   4. build_vt_cuda  组装出厂
 
+#include <cstring>
 #include <sstream>
 
 #include "vt_cuda.hpp"
@@ -52,7 +54,7 @@ cudaStream_t CudaContext::cur_stream() const {
 }
 
 // ---------------------------------------------------------------------------
-// 2. CudaTensor —— 设备显存块
+// 2. CudaTensor —— 内存块：设备显存 / 主机锁页
 
 // cudaMalloc 作用于"当前设备"，分配前先切到目标设备（字段是 const，
 // 只能借构造函数的初始化列表落地，所以包成静态助手函数）
@@ -70,31 +72,57 @@ static void* dev_alloc(int dev, size_t bytes) {
     return p;
 }
 
+// 主机锁页内存（pinned）：H2D/D2H 拷贝直达，不经 runtime 的 staging 缓冲；
+// 不属于任何设备（UVA 下全设备可见），析构 cudaFreeHost 也不用切设备
+static void* host_alloc(size_t bytes) {
+    if (bytes == 0) {
+        return nullptr;
+    }
+    void* p = nullptr;
+    if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        vt_panic("CudaTensor: cudaHostAlloc failed");
+    }
+    return p;
+}
+
 CudaTensor::CudaTensor(int dev, size_t dev_size)
     : size_(dev_size), data_(dev_alloc(dev, dev_size)), device_(dev) {
+}
+
+CudaTensor::CudaTensor(size_t host_size)
+    : size_(host_size), data_(host_alloc(host_size)), device_(-1), host_(true) {
 }
 
 CudaTensor::CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t view_size)
     : size_(view_size),
       data_((char*)owner->data_ + offset),
       device_(owner->device_),
+      host_(owner->host_),
       view_(true),
       // 视图的视图也扁平指向真身：owner 链永远只有一层
       owner_(owner->view_ ? owner->owner_ : owner) {
 }
 
 CudaTensor::~CudaTensor() {
-    // view 不拥有显存：真身由自己的栈生命周期负责释放
+    // view 不拥有内存：真身由自己的栈生命周期负责释放
     if (!view_ && data_ != nullptr) {
-        cudaSetDevice(device_);    // cudaFree 也作用于当前设备，先切回去
-        cudaFree(data_);
+        if (host_) {
+            cudaFreeHost(data_);
+        } else {
+            cudaSetDevice(device_);    // cudaFree 也作用于当前设备，先切回去
+            cudaFree(data_);
+        }
     }
 }
 
 std::string CudaTensor::to_string() {
     std::ostringstream os;
-    os << "dev=" << device_
-       << " 0x" << std::hex << (uintptr_t)data_ << std::dec
+    if (host_) {
+        os << "host";
+    } else {
+        os << "dev=" << device_;
+    }
+    os << " 0x" << std::hex << (uintptr_t)data_ << std::dec
        << " " << size_ << "B";
     if (view_) os << " [view]";
     return os.str();
@@ -118,6 +146,18 @@ struct AllocWord : vt::NativeWord<CudaTensor> {
     }
 };
 
+// host.alloc：( n_bytes -- tensor ) 数 → 主机锁页内存块。cudaHostAlloc 不挑设备
+// （pinned 内存全设备可见），纯分配不需要 ctx，所以是 LR 形态
+struct HostAllocWord : vt::NativeWord<CudaTensor> {
+    static vt::NativeWord<CudaTensor>* creator(CudaEnv&) { return new HostAllocWord(); }
+
+    void run(vt::Stack<CudaTensor>& stack) override {
+        double n = stack.pop_number();
+        vt_assert(n >= 0 && n == (double)(size_t)n, "host.alloc: size must be non-negative integer");
+        stack.push_tensor(std::make_shared<CudaTensor>((size_t)n));
+    }
+};
+
 // cuda.sync：( -- ) 等 default stream 排空——异步发射之后、想看结果之前的那道闸
 struct SyncWord : vt::NativeWord<CudaTensor> {
     CudaContext* ctx_;
@@ -131,7 +171,8 @@ struct SyncWord : vt::NativeWord<CudaTensor> {
     }
 };
 
-// cuda.zeros：( tensor -- tensor ) 用 0 填充目标地址（字节级，无 dtype）
+// cuda.zeros：( tensor -- tensor ) 用 0 填充目标地址（字节级，无 dtype）。
+//   设备块走流异步；host 块是 CPU 内存，直接 memset（memset* 家族只认设备指针）
 struct ZerosWord : vt::NativeWord<CudaTensor> {
     CudaContext* ctx_;
     ZerosWord(CudaEnv& env) : ctx_(env.ctx()) {}
@@ -140,7 +181,9 @@ struct ZerosWord : vt::NativeWord<CudaTensor> {
     void run(vt::Stack<CudaTensor>& stack) override {
         auto t = stack.pop_tensor();
         if (t->size_ > 0) {
-            if (cudaMemsetAsync(t->data_, 0, t->size_, ctx_->cur_stream()) != cudaSuccess) {
+            if (t->host_) {
+                memset(t->data_, 0, t->size_);
+            } else if (cudaMemsetAsync(t->data_, 0, t->size_, ctx_->cur_stream()) != cudaSuccess) {
                 vt_panic("cuda.zeros: cudaMemsetAsync failed");
             }
         }
@@ -148,7 +191,7 @@ struct ZerosWord : vt::NativeWord<CudaTensor> {
     }
 };
 
-// cuda.view：( tensor offset size -- view ) 从已有显存块上偏移切一片。
+// cuda.view：( tensor offset size -- view ) 从已有内存块（设备/host 均可）上偏移切一片。
 //   纯栈操作不碰 CUDA（不分配不拷贝），不需要 ctx，所以是 LR 形态。
 //   owner_ 钉住真身：view 活着真身就不会被释放，地址永远有效。
 //   越界即 panic：坏 view 会让后续写词踩到别人的显存
@@ -190,6 +233,7 @@ CudaEnv* build_vt_cuda() {
     auto* env = new CudaEnv(&ctx);
 
     // CUDA 层词表
+    env->insert_native_word("host.alloc",       HostAllocWord::creator);
     env->insert_native_word("cuda.alloc",       AllocWord::creator);
     env->insert_native_word("cuda.view",        ViewWord::creator);
     env->insert_native_word("cuda.zeros",       ZerosWord::creator);
