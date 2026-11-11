@@ -324,7 +324,29 @@
 'blk.%%.indexer.q_proj.weight' dup2 gguf.load swap !
 %endf
 
+; ============================================================================
+; 全局常驻变量 —— Prefill & Decode 共享使用
+; ============================================================================
+
+
+
+
+; ============================================================================
+; prefill 常驻变量 —— 一个 chunk（T 个 token）走完 48 层的全部 scratch
+; ============================================================================
+
+; ---- chunk 尺寸：唯一的旋钮，进 hash 后续行 'T' @ 随取 ----
+1024 'T' !
+
+; ---- 入口：token 与 RoPE 表（§3.7 run_pass 步 1/2）----
+'T' @ 4 *        cuda.alloc 'pf.tokens' !   ; T × i32        prompt 的 token id
+
+
+; ---- 出口：lm_head 只需最后一个位置的 logits（§3.7 步 4）----
+248320 4 * cuda.alloc 'pf.logits' !          ; VOCAB f32 末行 logits（argmax 出 next token）
+
+
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
 cuda.sync
-'qwen3.8-next loaded: 1071 dense weights resident' ?
+'qwen3.8-next loaded: 1071 dense weights + memory resident' ?
