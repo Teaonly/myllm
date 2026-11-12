@@ -37,7 +37,6 @@ int main(int argc, char** argv) {
 
     // 3. 服务循环：stdin 协议行 → 解析 / 在途记账（单 session）→ stdout
     //    （scheduler.h 头注——计算侧接入后 overlap 五拍挂进 run）
-    myllm::Scheduler sched;    // ctx_cap 缺省 128000 = 剧本 MC
-    sched.run();
-    return 0;
+    myllm::Scheduler sched;    // 配置不在此处：run() 内从剧本 hash 读 MC/CS
+    return sched.run(env);
 }
