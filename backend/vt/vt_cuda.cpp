@@ -4,9 +4,10 @@
 //   1. CudaContext    资源池：设备 + 流 + 事件
 //   2. CudaTensor     显存块：分配 / 释放 / 打印
 //   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / host.alloc / cuda.view / cuda.zeros /
-//                     cuda.set_stream / cuda.sync）
+//                     tensor.copy / cuda.set_stream / cuda.sync）
 //   4. build_vt_cuda  组装出厂
 
+#include <cstring>
 #include <sstream>
 
 #include "vt_cuda.hpp"
@@ -189,6 +190,43 @@ struct ZerosWord : vt::NativeWord<CudaTensor> {
     }
 };
 
+// tensor.copy：( src dst -- dst ) 字节级搬运，src 的全部字节 → dst（同 gguf.load：
+//   src 大于 dst 即 panic，小于合法——往大块 slab 的 view 里拷）。
+//   按两侧 host/dev 各归各路径：host→host 走 CPU memcpy（同步直达，不占流）；
+//   其余三种组合 cudaMemcpyAsync 发到 default stream——目标流上的执行：与
+//   kernel 同流即同序，前面写 dst 的 kernel、后面读 dst 的 kernel 都不用额外同步。
+//   host 侧只会是 pinned 锁页（host.alloc 出身），异步 H2D/D2H 直达不经 staging。
+//   拷贝区间重叠（同一真身上挪字节，如 hist 滑窗）即 panic：CUDA 拷贝对重叠
+//   未定义，那种原地挪请走 kernel（ple_history_advance 一类）
+struct CopyWord : vt::NativeWord<CudaTensor> {
+    CudaContext* ctx_;
+    CopyWord(CudaEnv& env) : ctx_(env.ctx()) {}
+    static vt::NativeWord<CudaTensor>* creator(CudaEnv& env) { return new CopyWord(env); }
+
+    void run(vt::Stack<CudaTensor>& stack) override {
+        auto dst = stack.pop_tensor();           // 栈顶：目的地（DSL 里后压）
+        auto src = stack.pop_tensor();           // 深层：源
+        vt_assert(src->size_ <= dst->size_, "tensor.copy: src bigger than dst");
+        if (src->size_ > 0) {
+            char* s = (char*)src->data_;
+            char* d = (char*)dst->data_;
+            vt_assert(s + src->size_ <= d || d + src->size_ <= s,
+                      "tensor.copy: src/dst ranges overlap");
+            if (src->host_ && dst->host_) {
+                memcpy(d, s, src->size_);
+            } else {
+                cudaMemcpyKind kind = src->host_  ? cudaMemcpyHostToDevice
+                                      : dst->host_ ? cudaMemcpyDeviceToHost
+                                                   : cudaMemcpyDeviceToDevice;
+                if (cudaMemcpyAsync(d, s, src->size_, kind, ctx_->cur_stream()) != cudaSuccess) {
+                    vt_panic("tensor.copy: cudaMemcpyAsync failed");
+                }
+            }
+        }
+        stack.push_tensor(dst);
+    }
+};
+
 // cuda.view：( tensor offset size -- view ) 从已有内存块（设备/host 均可）上偏移切一片。
 //   纯栈操作不碰 CUDA（不分配不拷贝），不需要 ctx，所以是 LR 形态。
 //   owner_ 钉住真身：view 活着真身就不会被释放，地址永远有效。
@@ -235,6 +273,7 @@ CudaEnv* build_vt_cuda() {
     env->insert_native_word("cuda.alloc",       AllocWord::creator);
     env->insert_native_word("cuda.view",        ViewWord::creator);
     env->insert_native_word("cuda.zeros",       ZerosWord::creator);
+    env->insert_native_word("tensor.copy",      CopyWord::creator);
     env->insert_native_word("cuda.set_stream",  SetStreamWord::creator);
     env->insert_native_word("cuda.sync",        SyncWord::creator);
 
