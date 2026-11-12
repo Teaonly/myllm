@@ -1,4 +1,4 @@
-# engine/Makefile —— 编译引擎：g++（C++ 侧）+ gcc（C 库）+ nvcc（CUDA 侧）
+# backend/Makefile —— 编译引擎：g++（C++ 侧）+ gcc（C 库）+ nvcc（CUDA 侧）
 #
 # - vt/ 是自包含模块：vt.hpp（DSL 机）+ vt_cuda.*（CUDA 绑定）+ vt_gguf.*（GGUF 加载）
 # - vt_cuda.cpp 含 CUDA kernel，用 nvcc -x cu 编译（文件名保持 .cpp）
@@ -15,7 +15,7 @@ CXXFLAGS  := -std=c++17 -O0 -g -Wall -I. -I$(CUDA_HOME)/include
 CFLAGS    := -O2 -Wall
 NVCCFLAGS := -std=c++17 -O0 -g -I. -x cu -Xcompiler -Wall
 
-BIN   := build/engine
+BIN   := build/backend
 SRCS  := main.cpp vt/vt_gguf.cpp                 # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \

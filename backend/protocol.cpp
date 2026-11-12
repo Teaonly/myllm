@@ -1,8 +1,8 @@
 // ===========================================================================
 // protocol.cpp — 消息映射 + 编码器(JSON 解析交给 nlohmann/json)
 // ===========================================================================
-// 解析层是 vendored 的 nlohmann/json v3.11.3 单头文件(engine/opt/nlohmann/
-// json.hpp,经 -I engine/opt 引入;实现细节封在本 .cpp,protocol.h 不感知)。
+// 解析层是 vendored 的 nlohmann/json v3.11.3 单头文件(backend/opt/nlohmann/
+// json.hpp,经 -I backend/opt 引入;实现细节封在本 .cpp,protocol.h 不感知)。
 // 两处与本模块的关键适配:
 //   - json::parse(..., allow_exceptions=false):解析失败不抛异常、返回
 //     discarded 值——对齐"bool + err"的错误风格。默认即严格模式(尾随

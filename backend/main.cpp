@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     //    内存模型：embedding/PLE/MOE 大块不装，名单与层布局见剧本头注释）
     std::ifstream vf("qwen3.8-next.vt");
     if (!vf) {
-        std::cerr << "can't open qwen3.8-next.vt (run from engine/)" << std::endl;
+        std::cerr << "can't open qwen3.8-next.vt (run from backend/)" << std::endl;
         return 1;
     }
     std::stringstream ss;

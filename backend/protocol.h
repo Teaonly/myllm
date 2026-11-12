@@ -8,8 +8,8 @@
 // 错误行各自一条 ErrorMsg（busy / context_length_exceeded）。一拍出口的
 // 整体编码见 encode_outbound。
 //
-// JSON 解析用 vendored 的 nlohmann/json v3.11.3 单头文件（engine/opt/
-// nlohmann/json.hpp，-I engine/opt）；实现细节封在 protocol.cpp，本头文件
+// JSON 解析用 vendored 的 nlohmann/json v3.11.3 单头文件（backend/opt/
+// nlohmann/json.hpp，-I backend/opt）；实现细节封在 protocol.cpp，本头文件
 // 不感知库的存在。
 // ===========================================================================
 #pragma once
@@ -55,7 +55,7 @@ bool decode_line(std::string_view line, std::vector<Inbound>& out, std::string& 
 // 出口两态，与 Inbound 对称地用 variant 承载：
 //   TokenRow —— 正常产 token（逐 token 一行，finished=true 收尾）；
 //   ErrorRow —— 准入拒绝：被拒 uid 零 token 产出，只出一行错误
-//               （engine.h 不变量 1）。
+//               （backend.h 不变量 1）。
 struct TokenRow {
     int uid;
     int32_t next_token;
@@ -64,7 +64,7 @@ struct TokenRow {
 
 // 拒绝原因是语义枚举，不是 wire 串：Busy=瞬态可重试，TooLong=永久。
 // code=busy / context_length_exceeded 的映射只活在 protocol.cpp——
-// Engine 不知道 wire 的存在（engine.h 分层原则）。
+// Engine 不知道 wire 的存在（backend.h 分层原则）。
 enum class RejectReason { Busy, TooLong };
 
 struct ErrorRow {
