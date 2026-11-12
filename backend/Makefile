@@ -11,12 +11,12 @@ CXX       := g++
 CC        := gcc
 NVCC      := $(CUDA_HOME)/bin/nvcc
 
-CXXFLAGS  := -std=c++17 -O0 -g -Wall -I. -I$(CUDA_HOME)/include
+CXXFLAGS  := -std=c++17 -O0 -g -Wall -I. -Iopt -I$(CUDA_HOME)/include
 CFLAGS    := -O2 -Wall
 NVCCFLAGS := -std=c++17 -O0 -g -I. -x cu -Xcompiler -Wall
 
 BIN   := build/backend
-SRCS  := main.cpp vt/vt_gguf.cpp                 # g++ 侧源文件，往这列里加
+SRCS  := main.cpp scheduler.cpp protocol.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \
          $(patsubst %.c,build/%.o,$(CSRCS))
@@ -41,6 +41,15 @@ build/vt/vt_cuda.o: vt/vt_cuda.cpp vt/vt_cuda.hpp vt/vt.hpp
 clean:
 	rm -rf build
 
+# host 侧单元测试（无 GPU / 无 CUDA；被测源码直接编入测试目标——库目标待
+# 模块成形再拆）。跑法：make test
+build/scheduler_test: test/scheduler_test.cpp scheduler.cpp protocol.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+test: build/scheduler_test
+	build/scheduler_test
+
 -include $(DEPS)
 
-.PHONY: clean
+.PHONY: clean test

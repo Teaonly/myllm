@@ -62,10 +62,11 @@ struct TokenRow {
     bool finished;
 };
 
-// 拒绝原因是语义枚举，不是 wire 串：Busy=瞬态可重试，TooLong=永久。
+// 拒绝原因是语义枚举，不是 wire 串：Busy=瞬态可重试，TooLong=永久，
+// ShuttingDown=引擎退出中（未分类错误，wire 侧省略 code——protocol.md §6）。
 // code=busy / context_length_exceeded 的映射只活在 protocol.cpp——
 // Engine 不知道 wire 的存在（backend.h 分层原则）。
-enum class RejectReason { Busy, TooLong };
+enum class RejectReason { Busy, TooLong, ShuttingDown };
 
 struct ErrorRow {
     int uid;

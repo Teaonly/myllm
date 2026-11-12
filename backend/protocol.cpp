@@ -256,6 +256,12 @@ std::string encode_outbound(const std::vector<Outbound>& rows) {
                                       ? "input_ids exceeds ctx_cap"
                                       : e->message);
                 break;
+            case RejectReason::ShuttingDown:  // 空 code：省略字段=未分类（§6）
+                s += encode_error(e->uid, "",
+                                  e->message.empty()
+                                      ? "engine shutting down"
+                                      : e->message);
+                break;
             }
             s += '\n';
         } else {
