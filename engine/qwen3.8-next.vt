@@ -326,27 +326,110 @@
 'blk.%%.indexer.q_proj.weight' dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 %endf
 
+;
+;   系统核心配置
+;
+
+
+2048    "CS"  !    ; Prefill Chunk Size
+128000  "MC"  !    ; 最大上下文长度
+1       'DT'  !    ; decode 每步 token 数（投机解码接入时可调大）
+
+; ---- 几何常量（公式原料，数字进 hash，下文 @ 出来算）----
+2560  'N'  !    ; n_embd
+4     'HC' !    ; 残差流条数
+10240 'D'  !    ; HC*N，残差栈一行宽
+320   'LR' !    ; hc 低秩瓶颈宽
+10    'K'  !    ; 每 token 路由专家数
+512   'NE' !    ; 专家总数
+10240 'C'  !    ; GDN conv 通道数（q|k|v 连排）
+6144  'ZV' !    ; GDN value_dim（= QSA attn 宽 24×256）
+12288 'QW' !    ; QSA q 宽（24 头 × 2×256，q|gate 连排）
+2112  'SEL' !   ; QSA 选择宽（idx_top_k 2048 + 块余量，随实现调）
+
 ; ============================================================================
 ; 全局常驻变量 —— Prefill & Decode 共享使用
 ; ============================================================================
 
+248320 4 * cuda.alloc 'next.logits' !          ; VOCAB f32 末行 logits（argmax 出 next token）
 
+; ============================================================================
+; Prefill 激活缓冲 —— 全部随 CS 线性伸缩（字节 = 宽度 × CS × 元素大小）
+; ============================================================================
+
+; ---- 每token账：残差 124K + GDN 143K + QSA 85K + MoE 89K ≈ 443 KB ----
+; ---- CS=16384 时合计约 7 GiB；放不下就把 CS 先降到 2048（约 0.9 GiB）----
+; ---- 稳定后可把 GDN/QSA/MoE 三组暂存合并成 max() 一块轮用，省约一半 ----
+
+; 残差栈 / 超连接
+'CS' @  'D'  @ * 4 * cuda.alloc 'pf.R'      !  ; 残差栈本体 (CS, hc, N) f32
+'CS' @  'D'  @ * 2 * cuda.alloc 'pf.xn16'   !  ; norm 后各流的 bf16 像（参考契约）
+'CS' @  'LR' @ * 4 * cuda.alloc 'pf.lo'     !  ; 低秩瓶颈 f32
+'CS' @  'D'  @ * 4 * cuda.alloc 'pf.gated'  !  ; xn·sigmoid(gate)
+'CS' @  'HC' @ * 4 * cuda.alloc 'pf.inj'    !  ; 每流注入（两半段先后复用）
+'CS' @  'N'  @ * 4 * cuda.alloc 'pf.mixed'  !  ; 均值后的 mixer 输入
+'CS' @  'N'  @ * 4 * cuda.alloc 'pf.emb'    !  ; 本块 embedding（块输出 bo 与之别名）
+
+; GDN 层暂存
+'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.h'     !  ; conv→SiLU 后的 q|k|v
+'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.conv'  !  ; conv1d 输出（h 的前身）
+'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.o'     !  ; 递归步输出
+'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.z'     !  ; 输出门 z
+'CS' @  'ZV' @ * 2 * cuda.alloc 'pf.gdn.y16'   !  ; norm 后 y 的 bf16 像
+
+; QSA 层暂存
+'CS' @  'QW' @ * 4 * cuda.alloc 'pf.qsa.q'     !  ; q|gate 连排
+'CS' @  1024  * 4 * cuda.alloc 'pf.qsa.kv'     !  ; k、v 各 512 宽合一块
+'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.qsa.attn'  !  ; gate 前注意力输出
+'CS' @  128   * 4 * cuda.alloc 'pf.qsa.idxk'   !  ; indexer 原始键（norm 前）
+'CS' @  'SEL' @ * 4 * cuda.alloc 'pf.qsa.ids'  !  ; 选中 cell 号 int32
+
+; MoE 暂存
+'CS' @  'NE' @ * 4 *       cuda.alloc 'pf.moe.logits' !  ; 路由 logits
+'CS' @  'K'  @ * 8 *       cuda.alloc 'pf.moe.idsw'    !  ; top-k id(int32)+权重(f32) 同块
+'CS' @  'K'  @ * 1280 * 4 * cuda.alloc 'pf.moe.gu'     !  ; 激活后 gate|up 行
+'CS' @  'K'  @ * 640  * 4 * cuda.alloc 'pf.moe.h'      !  ; SwiGLU 中间
+'CS' @  'N'  @ * 4 *       cuda.alloc 'pf.moe.out'     !  ; combine（共享专家原地）
 
 
 ; ============================================================================
-; prefill 常驻变量 —— 一个 chunk（T 个 token）走完 48 层的全部 scratch
+; Decode 激活缓冲 —— cuda.view 从 prefill 缓冲借 T 行，零新增显存
 ; ============================================================================
+; prefill 与 decode 在同一 default stream 上先后执行（服务循环串行拍），decode
+; 每步的 scratch 直接切 prefill 块的首 'DT' 行视图，不另开显存；宽度公式与
+; pf.* 一一对应，只是 CS 换成 DT。
+; 每序列常驻的递归状态（GDN S / conv 状态 / QSA KV cache）不在此——布局随
+; Cache 模块设计定（设计文档 §10）。
 
-; ---- chunk 尺寸：唯一的旋钮，进 hash 后续行 'T' @ 随取 ----
-1024 'T' !
+; 残差栈 / 超连接
+'pf.R'      @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.R'      !  ; 残差栈行
+'pf.xn16'   @ 0 'DT' @ 'D'  @ * 2 * cuda.view 'dec.xn16'   !  ; norm 后 bf16 像
+'pf.lo'     @ 0 'DT' @ 'LR' @ * 4 * cuda.view 'dec.lo'     !  ; 低秩瓶颈
+'pf.gated'  @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.gated'  !  ; xn·sigmoid(gate)
+'pf.inj'    @ 0 'DT' @ 'HC' @ * 4 * cuda.view 'dec.inj'    !  ; 每流注入
+'pf.mixed'  @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.mixed'  !  ; mixer 输入
+'pf.emb'    @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.emb'    !  ; embedding 行
 
-; ---- 入口：token 与 RoPE 表（§3.7 run_pass 步 1/2）----
-'T' @ 4 *        cuda.alloc 'pf.tokens' !   ; T × i32        prompt 的 token id
+; GDN 层暂存
+'pf.gdn.h'    @ 0 'DT' @ 'C'  @ * 4 * cuda.view 'dec.gdn.h'    !
+'pf.gdn.conv' @ 0 'DT' @ 'C'  @ * 4 * cuda.view 'dec.gdn.conv' !
+'pf.gdn.o'    @ 0 'DT' @ 'ZV' @ * 4 * cuda.view 'dec.gdn.o'    !
+'pf.gdn.z'    @ 0 'DT' @ 'ZV' @ * 4 * cuda.view 'dec.gdn.z'    !
+'pf.gdn.y16'  @ 0 'DT' @ 'ZV' @ * 2 * cuda.view 'dec.gdn.y16'  !
 
+; QSA 层暂存
+'pf.qsa.q'    @ 0 'DT' @ 'QW' @ * 4 * cuda.view 'dec.qsa.q'     !  ; q|gate 连排
+'pf.qsa.kv'   @ 0 'DT' @ 1024 * 4 *    cuda.view 'dec.qsa.kv'   !  ; k、v 各 512 合一块
+'pf.qsa.attn' @ 0 'DT' @ 'ZV' @ * 4 *  cuda.view 'dec.qsa.attn' !
+'pf.qsa.idxk' @ 0 'DT' @ 128 * 4 *     cuda.view 'dec.qsa.idxk' !  ; indexer 原始键
+'pf.qsa.ids'  @ 0 'DT' @ 'SEL' @ * 4 * cuda.view 'dec.qsa.ids'  !  ; 选中 cell 号
 
-; ---- 出口：lm_head 只需最后一个位置的 logits（§3.7 步 4）----
-248320 4 * cuda.alloc 'pf.logits' !          ; VOCAB f32 末行 logits（argmax 出 next token）
-
+; MoE 暂存
+'pf.moe.logits' @ 0 'DT' @ 'NE' @ * 4 *      cuda.view 'dec.moe.logits' !
+'pf.moe.idsw'   @ 0 'DT' @ 'K' @ * 8 *       cuda.view 'dec.moe.idsw'   !
+'pf.moe.gu'     @ 0 'DT' @ 'K' @ * 1280 * 4 * cuda.view 'dec.moe.gu'     !
+'pf.moe.h'      @ 0 'DT' @ 'K' @ * 640  * 4 * cuda.view 'dec.moe.h'      !
+'pf.moe.out'    @ 0 'DT' @ 'N' @ * 4 *       cuda.view 'dec.moe.out'    !
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
