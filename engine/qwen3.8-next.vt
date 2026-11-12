@@ -5,7 +5,6 @@
 ;
 ; 内存模型参照 Strata run-iq3_s.sh：小权重（attention/ssm/超连接/共享专家/
 ; 路由/output_hc）全数常驻显存；大块不装，留给后续按需路径——
-;     blk.1.ple_*                         PLE 投影（6 个）
 ;     per_layer_token_embd.weight         PLE 巨表 28.8GB（在 00002 分片）
 ;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3）
 ; 词表矩阵（token_embd/output）模型层 weight-tied；pack 里是同源两种量化
@@ -20,9 +19,9 @@
 ;   cuda.alloc      ( n -- tensor )         显存块（host.alloc 则落主机锁页）
 ;   gguf.load       ( path name dst -- dst ) 装入（dev 异步 H2D / host 直拷）
 ;   swap !          ( tensor name -- ) 存进 hash；path 留栈
-; 装完 drop 掉路径。合计 1072 个 =
-;   3 顶层 output_hc + 1 词表矩阵(双名字一份显存) + 48 层 × 13 公共
-;   + 36 GDN 层 × 9 + 12 全注意力层 × 10
+; 装完 drop 掉路径。合计 1078 个 =
+;   3 顶层 output_hc + 1 词表矩阵(双名字一份显存) + 6 PLE 投影(blk.1)
+;   + 48 层 × 13 公共 + 36 GDN 层 × 9 + 12 全注意力层 × 10
 ; ============================================================================
 
 ; ---- 模型路径（文件头直接设定；dup 一份进 hash 留档，REPL 里 'model.gguf' @ 随取）----
@@ -334,6 +333,17 @@
 'blk.%%.indexer.q_proj.weight' dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 %endf
 
+; ---- PLE 投影（第 1 层专属 6 个，共 ≈63 MB；残差更新 R += hidden+gated+conv，
+;      跳过它算的是另一个模型——Strata gate C1 的教训）。注意还差三样：
+;      28.8GB 巨表 per_layer_token_embd（00002 分片，按需读）、会话态 hist
+;      （NG_HIST×10240 f32，规一化历史）、ple_prev（两个前置 token）----
+'blk.1.ple_conv1d.weight'     dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (4, 10240)  F16
+'blk.1.ple_key.weight'        dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (2560,10240) BF16  50 MB
+'blk.1.ple_norm_conv.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (10240,)    F32
+'blk.1.ple_norm_key.weight'   dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (10240,)    F32
+'blk.1.ple_norm_query.weight' dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (10240,)    F32
+'blk.1.ple_value.weight'      dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (2560,2560) BF16  12.5 MB
+
 ;
 ;   系统核心配置
 ;
@@ -492,4 +502,4 @@
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
 cuda.sync
-'qwen3.8-next loaded: 1072 dense weights (output≡token_embd, Q6_K) + memory resident' ?
+'qwen3.8-next loaded: 1078 dense weights (output≡token_embd Q6_K; PLE proj in; table on-demand) + memory resident' ?
