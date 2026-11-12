@@ -70,6 +70,11 @@ struct CudaTensor : vt::TensorType {
     CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t view_size);
     ~CudaTensor() override;
 
+    // 主控侧接口：剧本 hash 里的张量 find_tensor 出来，data() 拿裸指针喂
+    // kernel 的指针参数（cuda_kernels.cuh 的约定：cast 成目标类型直接用）。
+    // view 同样有效——owner_ 钉住真身，tensor 活着地址就不变。
+    void* data() const { return data_; }
+
     // vt 唯一接口要求（Echo "?" / Dump "??" 打印 cell 用）：
     // 打印 位置 + 16 进制地址 + 字节数，如 "dev=0 0x7f8a3c000000 4096B" /
     // "host 0x7f8a3c000000 4096B"

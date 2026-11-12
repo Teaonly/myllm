@@ -335,8 +335,8 @@
 
 ; ---- PLE 投影（第 1 层专属 6 个，共 ≈63 MB；残差更新 R += hidden+gated+conv，
 ;      跳过它算的是另一个模型——Strata gate C1 的教训）。注意还差三样：
-;      28.8GB 巨表 per_layer_token_embd（00002 分片，按需读）、会话态 hist
-;      （NG_HIST×10240 f32，规一化历史）、ple_prev（两个前置 token）----
+;      28.8GB 巨表 per_layer_token_embd（00002 分片，按需读）、prefill 的
+;      PLE 台阶（≈138 KB/token，Strata 从空闲 scratch 滚子批，见 session 区）----
 'blk.1.ple_conv1d.weight'     dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (4, 10240)  F16
 'blk.1.ple_key.weight'        dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (2560,10240) BF16  50 MB
 'blk.1.ple_norm_conv.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; (10240,)    F32
@@ -477,7 +477,7 @@
 ; ============================================================================
 ; Session 常驻状态 —— 单 session、最大 MC=128000，跨 chunk/token 持久
 ; （大小只跟 MC 走，与 CS/DT 无关；decode 注释里说的递归状态就是这一节）
-; 总账(MC=128000)：KV 2.93 GiB + idx 188 MiB + rope 31 MiB + GDN 118 MB ≈ 3.27 GiB
+; 总账(MC=128000)：KV 2.93 GiB + idx 188 MiB + rope 31 MiB + GDN 118 MB + PLE ≈640 KiB ≈ 3.27 GiB
 ; ============================================================================
 
 ; ---- QSA KV cache（12 层）----
@@ -498,6 +498,20 @@
                                                                     ; 转置布局（key维,头,value维)，参考实
                                                                     ; 现是 (S,S,VH)，写 kernel 勿混
 'GL' @ 'C'  @ * 3 * 4 *            cuda.alloc 'gdn.conv'  !  ; (GL, C, d_conv-1) f32 ≈4 MiB
+
+; ---- PLE 会话态（hist 是 PLE 在 session 区的全部递归状态，≈640 KiB 总）----
+9 'NGH' !    ; 历史行数 = (conv_kernel-1)×ngram_size = 3×3；ple.cu/ple.hpp 的 NG_HIST
+'NGH' @ 'D' @ * 4 * cuda.alloc 'ple.hist' !    ; (9, 10240) f32 = 360 KiB。行最快 hist[r+NGH*c]
+                                                ; （≠ gdn.S 的转置方向！ggml_reshape_3d ne0=行），oldest-
+                                                ; first，存 RMSNorm 后的规一化行；会话起始清零，每 token
+                                                ; shift 一行 + append 到第 8 行（ple_history_advance 原地）
+'N' @ 4 * host.alloc 'ple.embh' !              ; gather 出的 2560 宽行，host 暂存
+'N' @ 4 * cuda.alloc 'ple.embd' !              ; 同行上设备（ple_block 的 emb 入参）
+5 'D' @ * 'N' @ + 4 + 4 * 'N' @ 32 / 34 * + 'N' @ 2 * + 256 + 'D' @ 4 * +
+cuda.alloc 'ple.scratch' !                     ; 264,112 B = ple_block 的 223,152（5×hc_dim+n_embd+hc 的
+                                                ; f32 + Q8 激活像 + bf16 embedding 像，各 16 对齐）+ 规一化
+                                                ; 导出行 D×4（落在 scratch+223152 偏移，advance 的输入，
+                                                ; 须与 hist 不相交）。kernel 里勿在 capture 中 malloc
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
