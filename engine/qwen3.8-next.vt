@@ -5,10 +5,13 @@
 ;
 ; 内存模型参照 Strata run-iq3_s.sh：小权重（attention/ssm/超连接/共享专家/
 ; 路由/output_hc）全数常驻显存；大块不装，留给后续按需路径——
-;     token_embd.weight / output.weight   embedding/解嵌入（词表 248320）
 ;     blk.1.ple_*                         PLE 投影（6 个）
 ;     per_layer_token_embd.weight         PLE 巨表 28.8GB（在 00002 分片）
 ;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3）
+; 词表矩阵（token_embd/output）模型层 weight-tied；pack 里是同源两种量化
+; （output=Q6_K 497MiB，token_embd=IQ4_XS 322MiB），装高精度 Q6_K 一份、
+; 两个名字共用（embedding 侧吃到更高精度的同一矩阵，省 322MiB）。
+; 注意：'token_embd.weight' @ 取到的块按 Q6_K 解码，勿按 GGUF 目录的 IQ4_XS。
 ;
 ; 装载模式（路径常驻栈底，逐张量复用；三步：探尺寸 → 分配 → 装入）：
 ;     '名字' dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
@@ -17,8 +20,9 @@
 ;   cuda.alloc      ( n -- tensor )         显存块（host.alloc 则落主机锁页）
 ;   gguf.load       ( path name dst -- dst ) 装入（dev 异步 H2D / host 直拷）
 ;   swap !          ( tensor name -- ) 存进 hash；path 留栈
-; 装完 drop 掉路径。合计 1071 个 =
-;   3 顶层 output_hc + 48 层 × 13 公共 + 36 GDN 层 × 9 + 12 全注意力层 × 10
+; 装完 drop 掉路径。合计 1072 个 =
+;   3 顶层 output_hc + 1 词表矩阵(双名字一份显存) + 48 层 × 13 公共
+;   + 36 GDN 层 × 9 + 12 全注意力层 × 10
 ; ============================================================================
 
 ; ---- 模型路径（文件头直接设定；dup 一份进 hash 留档，REPL 里 'model.gguf' @ 随取）----
@@ -28,6 +32,10 @@
 'output_hc_down.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 'output_hc_norm.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 'output_hc_up.weight'    dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
+
+; ---- 词表矩阵（Q6_K 一份显存，双名字；weight-tied，见文件头注释）----
+'output.weight'      dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; 解嵌入 = Q6_K ≈497 MiB
+'output.weight' @ 'token_embd.weight' !    ; embedding 同一块显存的第二个名字（按 Q6_K 解码）
 
 ; ---- 48 层公共：FFN 共享专家 + 路由 + 超连接（13 个/层）----
 %for 0 47
@@ -345,7 +353,17 @@
 10240 'C'  !    ; GDN conv 通道数（q|k|v 连排）
 6144  'ZV' !    ; GDN value_dim（= QSA attn 宽 24×256）
 12288 'QW' !    ; QSA q 宽（24 头 × 2×256，q|gate 连排）
-2112  'SEL' !   ; QSA 选择宽（idx_top_k 2048 + 块余量，随实现调）
+2051  'SEL' !   ; QSA 选择宽 = idx_top_k + idx_block − 1 = 2048+4−1（qsa.hpp qsa_selection_width）
+
+12   'QL' !    ; QSA 全注意力层数（(层号+1)%4==0）
+36   'GL' !    ; GDN 线性注意力层数
+2    'KH' !    ; QSA kv 头数（GQA 24:2）
+256  'HD' !    ; QSA 头宽
+512  'KW' !    ; KH*HD：单份 K（或 V）每 cell 宽
+128  'S'  !    ; GDN 状态维（key/value 头宽同）
+48   'VH' !    ; GDN value 头数
+4    'IB' !    ; indexer 池化块长（每 4 cell 一个键）
+128  'ID' !    ; indexer 键宽
 
 ; ============================================================================
 ; 全局常驻变量 —— Prefill & Decode 共享使用
@@ -357,17 +375,20 @@
 ; Prefill 激活缓冲 —— 全部随 CS 线性伸缩（字节 = 宽度 × CS × 元素大小）
 ; ============================================================================
 
-; ---- 每token账：残差 124K + GDN 143K + QSA 85K + MoE 89K ≈ 443 KB ----
-; ---- CS=16384 时合计约 7 GiB；放不下就把 CS 先降到 2048（约 0.9 GiB）----
-; ---- 稳定后可把 GDN/QSA/MoE 三组暂存合并成 max() 一块轮用，省约一半 ----
+; ---- 每token账：残差 129K + GDN 143K + QSA 90K + MoE 196K ≈ 558 KB ----
+; ---- （MoE 含 parts T×K×N=100K/token，初版账漏了它）----
+; ---- CS=2048 时合计约 1.1 GiB；稳定后可把 GDN/QSA/MoE 三组暂存 ----
+; ---- 合并成 max() 一块轮用，省约一半 ----
 
 ; 残差栈 / 超连接
 'CS' @  'D'  @ * 4 * cuda.alloc 'pf.R'      !  ; 残差栈本体 (CS, hc, N) f32
 'CS' @  'D'  @ * 2 * cuda.alloc 'pf.xn16'   !  ; norm 后各流的 bf16 像（参考契约）
 'CS' @  'LR' @ * 4 * cuda.alloc 'pf.lo'     !  ; 低秩瓶颈 f32
+'CS' @  'LR' @ * 2 * cuda.alloc 'pf.lo16'   !  ; 低秩瓶颈 bf16 像（参考契约，up 投影吃它）
 'CS' @  'D'  @ * 4 * cuda.alloc 'pf.gated'  !  ; xn·sigmoid(gate)
 'CS' @  'HC' @ * 4 * cuda.alloc 'pf.inj'    !  ; 每流注入（两半段先后复用）
 'CS' @  'N'  @ * 4 * cuda.alloc 'pf.mixed'  !  ; 均值后的 mixer 输入
+'CS' @  'N'  @ * 2 * cuda.alloc 'pf.mixed16' ! ; router 契约 / f16 GEMM 的 bf16 像（纯 f32 GEMM 可省）
 'CS' @  'N'  @ * 4 * cuda.alloc 'pf.emb'    !  ; 本块 embedding（块输出 bo 与之别名）
 
 ; GDN 层暂存
@@ -382,6 +403,7 @@
 'CS' @  1024  * 4 * cuda.alloc 'pf.qsa.kv'     !  ; k、v 各 512 宽合一块
 'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.qsa.attn'  !  ; gate 前注意力输出
 'CS' @  128   * 4 * cuda.alloc 'pf.qsa.idxk'   !  ; indexer 原始键（norm 前）
+'CS' @  512   * 4 * cuda.alloc 'pf.qsa.qidx'  !  ; indexer 查询向量（4 头 × 128，norm 后）
 'CS' @  'SEL' @ * 4 * cuda.alloc 'pf.qsa.ids'  !  ; 选中 cell 号 int32
 
 ; MoE 暂存
@@ -389,7 +411,11 @@
 'CS' @  'K'  @ * 8 *       cuda.alloc 'pf.moe.idsw'    !  ; top-k id(int32)+权重(f32) 同块
 'CS' @  'K'  @ * 1280 * 4 * cuda.alloc 'pf.moe.gu'     !  ; 激活后 gate|up 行
 'CS' @  'K'  @ * 640  * 4 * cuda.alloc 'pf.moe.h'      !  ; SwiGLU 中间
+'CS' @  'K'  @ * 'N'  @ * 4 * cuda.alloc 'pf.moe.parts' !  ; 各专家输出 (CS,K,N)，combine 的输入——MoE 最大一项
 'CS' @  'N'  @ * 4 *       cuda.alloc 'pf.moe.out'     !  ; combine（共享专家原地）
+'CS' @  640 * 4 * cuda.alloc 'pf.moe.shH'   !  ; 共享专家 SwiGLU 中间 f32（gate|up 可原地）
+'CS' @  640 * 2 * cuda.alloc 'pf.moe.shH16' !  ; 共享专家 down 入参 bf16 像（契约）
+'CS' @  4 *       cuda.alloc 'pf.moe.shg'   !  ; 共享专家标量门 f32（每 token 一个）
 
 
 ; ============================================================================
@@ -398,16 +424,18 @@
 ; prefill 与 decode 在同一 default stream 上先后执行（服务循环串行拍），decode
 ; 每步的 scratch 直接切 prefill 块的首 'DT' 行视图，不另开显存；宽度公式与
 ; pf.* 一一对应，只是 CS 换成 DT。
-; 每序列常驻的递归状态（GDN S / conv 状态 / QSA KV cache）不在此——布局随
-; Cache 模块设计定（设计文档 §10）。
+; 每序列常驻的递归状态（GDN S / conv 状态 / QSA KV cache）不在此——见下方
+; "Session 常驻状态"一节（原设计文档 §10 的布局由该节落地）。
 
 ; 残差栈 / 超连接
 'pf.R'      @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.R'      !  ; 残差栈行
 'pf.xn16'   @ 0 'DT' @ 'D'  @ * 2 * cuda.view 'dec.xn16'   !  ; norm 后 bf16 像
 'pf.lo'     @ 0 'DT' @ 'LR' @ * 4 * cuda.view 'dec.lo'     !  ; 低秩瓶颈
+'pf.lo16'   @ 0 'DT' @ 'LR' @ * 2 * cuda.view 'dec.lo16'   !  ; 低秩瓶颈 bf16 像
 'pf.gated'  @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.gated'  !  ; xn·sigmoid(gate)
 'pf.inj'    @ 0 'DT' @ 'HC' @ * 4 * cuda.view 'dec.inj'    !  ; 每流注入
 'pf.mixed'  @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.mixed'  !  ; mixer 输入
+'pf.mixed16' @ 0 'DT' @ 'N'  @ * 2 * cuda.view 'dec.mixed16' ! ; router bf16 像
 'pf.emb'    @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.emb'    !  ; embedding 行
 
 ; GDN 层暂存
@@ -422,6 +450,7 @@
 'pf.qsa.kv'   @ 0 'DT' @ 1024 * 4 *    cuda.view 'dec.qsa.kv'   !  ; k、v 各 512 合一块
 'pf.qsa.attn' @ 0 'DT' @ 'ZV' @ * 4 *  cuda.view 'dec.qsa.attn' !
 'pf.qsa.idxk' @ 0 'DT' @ 128 * 4 *     cuda.view 'dec.qsa.idxk' !  ; indexer 原始键
+'pf.qsa.qidx' @ 0 'DT' @ 512 * 4 *     cuda.view 'dec.qsa.qidx' !  ; indexer 查询向量
 'pf.qsa.ids'  @ 0 'DT' @ 'SEL' @ * 4 * cuda.view 'dec.qsa.ids'  !  ; 选中 cell 号
 
 ; MoE 暂存
@@ -430,8 +459,37 @@
 'pf.moe.gu'     @ 0 'DT' @ 'K' @ * 1280 * 4 * cuda.view 'dec.moe.gu'     !
 'pf.moe.h'      @ 0 'DT' @ 'K' @ * 640  * 4 * cuda.view 'dec.moe.h'      !
 'pf.moe.out'    @ 0 'DT' @ 'N' @ * 4 *       cuda.view 'dec.moe.out'    !
+'pf.moe.parts'  @ 0 'DT' @ 'K' @ * 'N' @ * 4 * cuda.view 'dec.moe.parts'  !
+'pf.moe.shH'    @ 0 'DT' @ 640 * 4 *         cuda.view 'dec.moe.shH'    !
+'pf.moe.shH16'  @ 0 'DT' @ 640 * 2 *         cuda.view 'dec.moe.shH16'  !
+'pf.moe.shg'    @ 0 'DT' @ 4 *               cuda.view 'dec.moe.shg'    !
+
+; ============================================================================
+; Session 常驻状态 —— 单 session、最大 MC=128000，跨 chunk/token 持久
+; （大小只跟 MC 走，与 CS/DT 无关；decode 注释里说的递归状态就是这一节）
+; 总账(MC=128000)：KV 2.93 GiB + idx 188 MiB + rope 31 MiB + GDN 118 MB ≈ 3.27 GiB
+; ============================================================================
+
+; ---- QSA KV cache（12 层）----
+; K+V = 2×12×128000×512×KVE；KVE=2(FP16)→2.93 GiB。卡紧改 KVE=1（INT8、
+; per-64 fp16 scale 另计）省 1.46 GiB；Q4_0+Hadamard 约 1/4，见 Strata kv_q4
+2 'KVE' !    ; KV 元素字节：2=FP16（默认）
+'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.K' !    ; (QL, MC, KW) K 池
+'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.V' !    ; (QL, MC, KW) V 池
+
+; ---- indexer 池化键 + 填充尾 + rope 表（全 QSA 层共享一份 rope）----
+'QL' @ 'MC' @ 'IB' @ / 2 + * 'ID' @ * 4 * cuda.alloc 'kv.idx' !      ; (QL, MC/IB+2, ID) f32 ≈188 MiB
+'QL' @ 'IB' @ 1 - * 'ID' @ * 4 *     cuda.alloc 'kv.idxtail' !       ; (QL, IB-1, ID) 填充中块的原始尾
+'MC' @ 32 * 4 * cuda.alloc 'qsa.cos' !    ; rope cos (MC, n_rot/2)，host float64 建表存 f32
+'MC' @ 32 * 4 * cuda.alloc 'qsa.sin' !    ; rope sin
+
+; ---- GDN 递归状态（36 层；turn checkpoint 的主体，≈118 MB，与 Strata 实测同量级）----
+'GL' @ 'S'  @ * 'VH' @ * 'S' @ * 4 * cuda.alloc 'gdn.S'    !  ; (GL, S, VH, S) f32 ≈108 MiB；注意是引擎
+                                                                    ; 转置布局（key维,头,value维)，参考实
+                                                                    ; 现是 (S,S,VH)，写 kernel 勿混
+'GL' @ 'C'  @ * 3 * 4 *            cuda.alloc 'gdn.conv'  !  ; (GL, C, d_conv-1) f32 ≈4 MiB
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
 cuda.sync
-'qwen3.8-next loaded: 1071 dense weights + memory resident' ?
+'qwen3.8-next loaded: 1072 dense weights (output≡token_embd, Q6_K) + memory resident' ?
