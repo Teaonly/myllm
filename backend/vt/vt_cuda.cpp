@@ -4,7 +4,7 @@
 //   1. CudaContext    资源池：设备 + 流 + 事件
 //   2. CudaTensor     显存块：分配 / 释放 / 打印
 //   3. native 词      栈 ↔ CUDA 的桥（cuda.alloc / host.alloc / cuda.view / cuda.zeros /
-//                     tensor.copy / cuda.set_stream / cuda.sync）
+//                     tensor.copy / tensor.size / cuda.set_stream / cuda.sync）
 //   4. build_vt_cuda  组装出厂
 
 #include <cstring>
@@ -227,6 +227,19 @@ struct CopyWord : vt::NativeWord<CudaTensor> {
     }
 };
 
+// tensor.size：( tensor -- n ) 探已有内存块的字节数（host/dev/view 均可）。
+//   host 备份区按 GPU 侧真身逐块镜像用：layout 一致就是字节数一致——
+//   不抄剧本里的尺寸公式（那边改了这边跟着错），直接问张量本人。
+//   纯栈操作不碰 CUDA，LR 形态
+struct SizeWord : vt::NativeWord<CudaTensor> {
+    static vt::NativeWord<CudaTensor>* creator(CudaEnv&) { return new SizeWord(); }
+
+    void run(vt::Stack<CudaTensor>& stack) override {
+        auto t = stack.pop_tensor();
+        stack.push_number((double)t->size_);
+    }
+};
+
 // cuda.view：( tensor offset size -- view ) 从已有内存块（设备/host 均可）上偏移切一片。
 //   纯栈操作不碰 CUDA（不分配不拷贝），不需要 ctx，所以是 LR 形态。
 //   owner_ 钉住真身：view 活着真身就不会被释放，地址永远有效。
@@ -274,6 +287,7 @@ CudaEnv* build_vt_cuda() {
     env->insert_native_word("cuda.view",        ViewWord::creator);
     env->insert_native_word("cuda.zeros",       ZerosWord::creator);
     env->insert_native_word("tensor.copy",      CopyWord::creator);
+    env->insert_native_word("tensor.size",      SizeWord::creator);
     env->insert_native_word("cuda.set_stream",  SetStreamWord::creator);
     env->insert_native_word("cuda.sync",        SyncWord::creator);
 

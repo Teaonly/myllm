@@ -43,6 +43,35 @@ void Scheduler::init_config(CudaEnv* env) {
     };
 }
 
+// 会话池解引用（结构见 scheduler.h 的 SessionPool）：按 kSessionBlocks 逐块
+// find_tensor，镜像名拼 "bak.<i>.<名>"（剧本备份区的命名约定）。剧本在场时
+// 名字找不到即 vt_panic——剧本与代码不同步的开发期 bug，fail fast 正是要的
+// 形态；hash 里连 "SS" 都没有（直驱单测无剧本）则整段跳过、pool 留空。
+void Scheduler::init_session_pool(CudaEnv* env) {
+    auto& hash = env->hash();
+    if (!hash.contains("SS")) {
+        std::fprintf(stderr,
+                     "scheduler: no SS in hash — session pool skipped (no script?)\n");
+        return;
+    }
+    pool_.ss = static_cast<int>(hash.find_number("SS"));
+    pool_.blocks.clear();
+    double host_bytes = 0;
+    for (const char* nm : kSessionBlocks) {
+        SessionPool::Block b;
+        b.dev = hash.find_tensor(nm);
+        for (int i = 0; i < pool_.ss; i++) {
+            b.host.push_back(
+                hash.find_tensor("bak." + std::to_string(i) + "." + nm));
+            host_bytes += (double)b.host.back()->size_;
+        }
+        pool_.blocks.push_back(std::move(b));
+    }
+    std::fprintf(stderr, "scheduler: session pool ready — %zu blocks × %d slots"
+                         ", %.2f GiB host mirror\n",
+                 pool_.blocks.size(), pool_.ss, host_bytes / (1 << 30));
+}
+
 // ---- 直驱口 -------------------------------------------------------------------
 
 void Scheduler::on_line(std::string_view line) {
@@ -142,7 +171,9 @@ bool Scheduler::read_lines(std::string& pending) {
 
 int Scheduler::run(CudaEnv* env) {
     // 0. 加载真实配置（准入上限 maxContentLength 从此取，单一事实源在剧本）
+    //    + 会话池解引用（session/备份张量的地址定死，快照/恢复接进各拍用）
     init_config(env);
+    init_session_pool(env);
 
     std::string pending;  // 半行残包：跨 chunk 的部分行，read_lines 内消化
     bool eof = false;

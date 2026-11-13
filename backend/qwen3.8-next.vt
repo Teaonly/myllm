@@ -352,6 +352,7 @@
 2048    "CS"  !    ; Prefill Chunk Size
 128000  "MC"  !    ; 最大上下文长度
 1       'DT'  !    ; decode 每步 token 数（投机解码接入时可调大）
+4       "SS"  !    ; CPU 上保存最新四份 Session 计算状态
 
 ; ---- 几何常量（公式原料，数字进 hash，下文 @ 出来算）----
 2560  'N'  !    ; n_embd
@@ -512,6 +513,31 @@ cuda.alloc 'ple.scratch' !                     ; 264,112 B = ple_block 的 223,1
                                                 ; f32 + Q8 激活像 + bf16 embedding 像，各 16 对齐）+ 规一化
                                                 ; 导出行 D×4（落在 scratch+223152 偏移，advance 的输入，
                                                 ; 须与 hist 不相交）。kernel 里勿在 capture 中 malloc
+
+; ============================================================================
+; Session CPU 备份 —— GPU 侧递归态的 host 镜像，SS=4 份（'SS' @ 在 hash）
+; 新提示词来了找最长可复用前缀命中的那份，tensor.copy 整份恢复回 GPU，
+; 省掉重 prefill。快照/恢复各是每张量一条 tensor.copy（D2H / H2D）+ cuda.sync
+;
+; 镜像 7 块（= GPU 侧全部会话递归态）：
+;   kv.K kv.V kv.idx kv.idxtail gdn.S gdn.conv ple.hist
+; 不镜像：qsa.cos/sin（静态 rope 表，启动建一次不随会话变）、
+;   ple.embh/embd/scratch 与 pf.*/dec.*（每 token / 每 chunk 暂存，重算不值钱）
+; 每份 ≈3.24 GiB（KV 2.93 + idx 0.18 + GDN 0.12 + idxtail/ple.hist 零头），
+; ×4 ≈13 GiB 锁页——本机 62G RAM 可容；SS 调大先算这笔账
+;
+; %for 边界只能写字面量（0..SS-1），SS 改了这里跟着改
+; ============================================================================
+
+%for 0 3
+'kv.K'       @ tensor.size host.alloc 'bak.%%.kv.K'       !
+'kv.V'       @ tensor.size host.alloc 'bak.%%.kv.V'       !
+'kv.idx'     @ tensor.size host.alloc 'bak.%%.kv.idx'     !
+'kv.idxtail' @ tensor.size host.alloc 'bak.%%.kv.idxtail' !
+'gdn.S'      @ tensor.size host.alloc 'bak.%%.gdn.S'      !
+'gdn.conv'   @ tensor.size host.alloc 'bak.%%.gdn.conv'   !
+'ple.hist'   @ tensor.size host.alloc 'bak.%%.ple.hist'   !
+%endf
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop

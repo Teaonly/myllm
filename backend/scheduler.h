@@ -44,6 +44,30 @@ struct SchedulerConfig {
     int prefillChunkSize;         // 剧本 "CS"（2048）：长 prefill 的分块步长
 };
 
+// 会话递归态的块名单——剧本 qwen3.8-next.vt session 区/备份区的同一份名单，
+// 顺序即块号，两侧共用。名单与剧本脱同步属开发期 bug：init_session_pool
+// 的 find_tensor 找不到名字当场 vt_panic（fail fast，同 init_config）。
+inline constexpr const char* kSessionBlocks[] = {
+    "kv.K", "kv.V", "kv.idx", "kv.idxtail", "gdn.S", "gdn.conv", "ple.hist",
+};
+
+// 会话池——init_session_pool() 在 run() 开头从剧本 hash 一次性解引用：
+// 每块 GPU 真身 + SS 份 host 镜像，地址由此定死，后续快照/恢复（接进各拍）
+// 按块号成对 cudaMemcpyAsync，不再回 hash 查名字。shared_ptr 全程钉住：
+// hash 被 '!' 重名覆盖或 drop 词清掉也不悬空（同 CudaTensor view 的 owner_
+// 钉法）。镜像字节数与 GPU 侧天然相等（剧本按 tensor.size 分配，装载已对账）。
+struct SessionPool {
+    struct Block {
+        std::shared_ptr<CudaTensor> dev;                // GPU 侧递归态块
+        std::vector<std::shared_ptr<CudaTensor>> host;  // SS 份 host 镜像
+        void*  dev_data() const { return dev->data(); }
+        void*  host_data(int slot) const { return host[slot]->data(); }
+        size_t bytes() const { return dev->size_; }
+    };
+    int ss = 0;                      // 镜像份数（剧本 "SS"；host.size() 同步）
+    std::vector<Block> blocks;       // 与 kSessionBlocks 同序同长
+};
+
 // 一路在途请求的 host 侧记账——“热 session”槽位的内容。两头对齐：
 //   前端侧——uid / params / input_ids 直接取自 UserMsg（protocol.h）；
 //            input_ids 是全量输入（多轮历史由前端并入，protocol.md），
@@ -75,6 +99,9 @@ public:
     // vt_assert 挡下（MC/CS 从 env hash 读——测试里 hash().set 注入即可，
     // 无需剧本与 GPU：Enviroment 是纯头文件模板）。
     void init_config(CudaEnv* env);
+    // 会话池解引用：run() 开头自动调用（init_config 之后）。要剧本真装完
+    // （hash 里有 SS 与 session/备份张量）；直驱单测无剧本则整体跳过留空。
+    void init_session_pool(CudaEnv* env);
     // 喂一行 stdin（不含 \n）。坏行记 stderr 后整行丢弃——含 Batch 半途已
     // 解出的消息（decode_line 契约；uid 不可恢复，无从回 ErrorMsg）。
     void on_line(std::string_view line);
@@ -83,6 +110,7 @@ public:
 
     // ---- 观测（测试与日志）----
     const Session* session() const { return session_ ? &*session_ : nullptr; }
+    const SessionPool* pool() const { return &pool_; }
     bool exit_requested() const { return exit_requested_; }
     bool idle() const { return !session_; }  // 无在途
 
@@ -98,6 +126,7 @@ private:
 
 private:
     std::optional<SchedulerConfig> cfg_;
+    SessionPool pool_;    // init_session_pool 填；run 之前 blocks 空
     // 热 session 单槽位：占用即满载——在途期间新到的 UserMsg 即回 busy
     // 错误行、不排队（单 session 语义；对等双流是后续扩展）。
     std::optional<Session> session_;

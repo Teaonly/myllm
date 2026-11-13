@@ -294,6 +294,12 @@ struct Hash {
         return map_[name];
     }
 
+    // 存在性探针：find 缺席即 panic（fail fast 契约），调用方要"缺席也合法"
+    // 的分支（如 scheduler 直驱单测无剧本）用这个先探
+    bool contains(const std::string& name) const {
+        return map_.find(name) != map_.end();
+    }
+
     double find_number(const std::string& name) {
         auto item = find(name);
         return std::get<0>(item);
