@@ -29,6 +29,7 @@
 //   - 不设行长上限：对端是自家进程，可信。
 
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -86,6 +87,11 @@ public:
 
     // 非零 = 曾遇到 read 错误（errno 原样留存），供排查打印；EOF 时为 0。
     int last_errno() const { return errno_; }
+
+    void try_poll(int timeout = -1) {
+        struct pollfd p{fd_, POLLIN, 0};
+        ::poll(&p, 1, timeout);
+    }
 
 private:
     const int fd_;      // 只读不关：生死归调用者

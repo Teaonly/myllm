@@ -37,9 +37,15 @@ public:
 
 protected:
     void init_config(CudaEnv* env);
+    
+    void beat_device(CudaEnv* env); // 在途的 worker_ ，持续工作
+    void push_device(CudaEnv* env, UserMsg& m); // 新的用户消息到达
+    void pull_device(CudaEnv* env, AbortMsg& m); // 结束指定的 worker_
+    void stop_device(CudaEnv* env); // 彻底结束计算
 
 private:
-    std::optional<SchedulerConfig> cfg_;
+    SchedulerConfig cfg_;
+    std::optional<Session> worker_;
     const int in_;        // 原始入口 fd：读行走 in_lines_，这个号留给 poll() 之类
     const int out_;       // 出口 fd：阻塞写
     FdLines in_lines_;    // stdin → 一行一行（协议行），查询式、绝不阻塞
