@@ -2,7 +2,7 @@
 #
 # - vt/ 是自包含模块：vt.hpp（DSL 机）+ vt_cuda.*（CUDA 绑定）+ vt_gguf.*（GGUF 加载）
 # - vt_cuda.cpp 用 nvcc -x cu 编译（文件名保持 .cpp）
-# - cuda/ 是 Kernel 开发目录：*.cu 全在这，nvcc 编；ktest.cpp 是对拍驱动
+# - kernel/ 是 Kernel 开发目录：*.cu 全在这，nvcc 编；ktest.cpp 是对拍驱动
 #   （golden safetensors → GPU → 判分），g++ 编
 # - opt/gguf 是 antirez 的 C 库（GGUF 解析），gcc 直接编
 # - 产物统一放 build/（根 .gitignore 已忽略），源码目录保持干净
@@ -21,10 +21,10 @@ NVCCFLAGS := -std=c++17 -O0 -g -arch=sm_80 -I. -x cu -Xcompiler -Wall
 BIN   := build/backend
 SRCS  := main.cpp scheduler.cpp protocol.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
-CUSRS := $(wildcard cuda/*.cu)                    # kernel 源，新增 .cu 免改本行
+CUSRS := $(wildcard kernel/*.cu)                  # kernel 源，新增 .cu 免改本行
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \
          $(patsubst %.c,build/%.o,$(CSRCS))
-CUOBJS := $(patsubst cuda/%.cu,build/cuda/%.o,$(CUSRS))
+CUOBJS := $(patsubst kernel/%.cu,build/kernel/%.o,$(CUSRS))
 DEPS  := $(OBJS:.o=.d)
 
 $(BIN): $(OBJS)
@@ -43,8 +43,8 @@ build/vt/vt_cuda.o: vt/vt_cuda.cpp vt/vt_cuda.hpp vt/vt.hpp
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-# cuda/*.cu：kernel 对象，头文件依赖手写（同上，nvcc 不走 -MMD）
-build/cuda/%.o: cuda/%.cu cuda/cuda_kernels.cuh
+# kernel/*.cu：kernel 对象，头文件依赖手写（同上，nvcc 不走 -MMD）
+build/kernel/%.o: kernel/%.cu kernel/cuda_kernels.cuh
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
@@ -62,7 +62,7 @@ test: build/scheduler_test
 
 # kernel 对拍测试（要 GPU；golden 默认路径按 backend/ cwd 相对，同 main.cpp
 # 的剧本约定）。跑法：make ktest
-build/ktest: cuda/ktest.cpp $(CUOBJS)
+build/ktest: kernel/ktest.cpp $(CUOBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart
 
 ktest: build/ktest
