@@ -503,16 +503,17 @@
 'offset' !!                                                  ; 临时量出hash：后续状态接着排时再立
 
 ; 主机端配置多分Session内存，届时一次 H2D 复制完成
-"session.cuda" @ tensor.size "SS" @ * host.alloc "session.host" !
 "session.cuda" @ tensor.size "SSIZE" !
+"SSIZE" @ "SS" @ * host.alloc "staff.sessions" !
 
 ; ============================================================================
 ; 同步内存 —— host↔device 采用
 ; 
 ; ============================================================================
-16 * 4 host.alloc "tokens"
-8 * 4  host.alloc "flags"
-8 * 4  host.alloc "cmds"
+16 * 4 host.alloc "tokens" !
+4 host.alloc "staff.targetSession" !
+4 host.alloc "staff.inputLeft" !
+4 host.alloc "staff.inputRight" !
 
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----

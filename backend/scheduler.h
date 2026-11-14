@@ -20,7 +20,25 @@ struct SchedulerConfig {
     int sessionSize;              // 剧本 "SSIZE"：一个 Session 状态块的字节数（session.cuda 尺寸）
 };
 
-struct Session {
+// 工作台三词：指向剧本 host.alloc 的锁页块（Mapped，host 与 kernel 都可
+// 直接 deref）。push_device 写入，beat_device/kernel 按拍推进
+struct SchedulerStaff {
+    void* allSessions = nullptr;    // 指向 savedSessions 开始内存地址（HOST）
+    int* targetSession = nullptr;   // 命中的镜像槽位：恢复镜像/落回同槽都认它
+    int* inputLeft = nullptr;       // 输入窗口左沿（绝对坐标）：待喂入游标 = 已算过数
+    int* inputRight = nullptr;      // 输入窗口右沿（绝对坐标）：prompt 末 = one-past-end
+};
+
+// 单流调度的状态
+enum SchedulerState {
+    IDLE = 0,       // 无在途会话：push_device 只在此态放行
+    CHUNKING = 1,   // prefill 分块喂入中：每拍喂 ≤CS 个 token，inputLeft 前进
+    CHUNKED = 2,    // 余量 ≤CS 一拍可吃完：待下一拍 drain 出首 token
+    DECODING = 3,   // 逐 token 生成中：每拍 1 个（DT），回填再喂
+    STOP = 4,       // 停机：run 出口用，不再接新活
+};
+
+struct SessionWorker {
     int uid = 0;
     SamplingParams params;
     std::vector<int32_t> input_ids;
@@ -45,9 +63,15 @@ protected:
     void stop_device(CudaEnv* env); // 彻底结束计算
 
 private:
+    SchedulerState state_ = SchedulerState::IDLE;
     SchedulerConfig cfg_;
     SessionCache cache_;
-    std::optional<Session> worker_;
+    SchedulerStaff staff_;
+    
+    SessionWorker worker_;
+
+    
+
     FdLines io_;          // 协议信道：next() 读协议行（查询式）、write_all() 写出口整段
 };
 
