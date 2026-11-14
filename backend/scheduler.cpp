@@ -25,9 +25,9 @@ int Scheduler::run(CudaEnv* env) {
 
     int error = 0;
     for (;;) {
-        auto lineJson = in_lines_.next();
-        bool isError = in_lines_.last_errno();
-        bool isClosed = in_lines_.closed();
+        auto lineJson = io_.next();
+        bool isError = io_.last_errno();
+        bool isClosed = io_.closed();
 
         // 简单处理错误
         if (isError != 0) {
@@ -81,7 +81,10 @@ int Scheduler::run(CudaEnv* env) {
 }
 
 void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
-    if (worker_) {        
+    if (worker_) {  // 满载：回 Busy 错误行拒绝这笔，在途不受扰（拒绝即零产出）
+        io_.write_all(encode_outbound(
+            {ErrorRow{m.uid, RejectReason::Busy, "session in flight (1/1)"}}));
+        return;
     }
     worker_ = Session{m.uid, std::move(m.params), std::move(m.input_ids)};
 }
@@ -96,7 +99,7 @@ void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {
 void Scheduler::beat_device(CudaEnv* env) {
     // 没有在工作，小睡等唤醒
     if (!worker_) {
-        in_lines_.try_poll(5);
+        io_.try_poll(5);
         return;
     }
 

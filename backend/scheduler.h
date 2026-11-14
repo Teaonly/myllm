@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-#include "opt/fdline.h"      // FdLines：stdin 协议行的查询式读取器
+#include "opt/fdline.h"      // FdLines：stdin/stdout 协议信道（读查询式 + 写整段必达）
 #include "protocol.h"
 #include "vt/vt_cuda.hpp"    // CudaEnv = vt::Enviroment<CudaTensor, CudaContext>
 
@@ -29,7 +29,7 @@ struct Session {
 class Scheduler {
 public:
     explicit Scheduler(int in_fd = 0, int out_fd = 1)
-        : in_(in_fd), out_(out_fd), in_lines_(in_fd) {
+        : io_(in_fd, out_fd) {
     }
 
     // 进程主循环：stdin 协议行 → 解码分发 → stdout 出口行。ExitMsg/EOF
@@ -46,9 +46,7 @@ protected:
 private:
     SchedulerConfig cfg_;
     std::optional<Session> worker_;
-    const int in_;        // 原始入口 fd：读行走 in_lines_，这个号留给 poll() 之类
-    const int out_;       // 出口 fd：阻塞写
-    FdLines in_lines_;    // stdin → 一行一行（协议行），查询式、绝不阻塞
+    FdLines io_;          // 协议信道：next() 读协议行（查询式）、write_all() 写出口整段
 };
 
 }  // namespace myllm
