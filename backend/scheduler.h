@@ -69,7 +69,6 @@ protected:
     void push_device(CudaEnv* env, UserMsg& m); // 新的用户消息到达
     void pull_device(CudaEnv* env, AbortMsg& m); // 结束指定的 worker_
     void stop_device(CudaEnv* env); // 彻底结束计算
-    void exec_device(CudaEnv* env); // execStream 上发射一拍前向（不等待）
 
 private:
     SchedulerState state_ = SchedulerState::IDLE;

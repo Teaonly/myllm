@@ -2,8 +2,8 @@
 #
 # - vt/ 是自包含模块：vt.hpp（DSL 机）+ vt_cuda.*（CUDA 绑定）+ vt_gguf.*（GGUF 加载）
 # - vt_cuda.cpp 用 nvcc -x cu 编译（文件名保持 .cpp）
-# - kernel/ 是 Kernel 开发目录：*.cu 全在这，nvcc 编；ktest.cpp 是对拍驱动
-#   （golden safetensors → GPU → 判分），g++ 编
+# - kernel/ 是 Kernel 开发目录：prefill.cpp 走 nvcc -x cu（要发射 kernel，
+#   g++ 编不了 <<<>>>，同 vt_cuda.cpp 路数）；接口头 index.h 两侧共用
 # - opt/gguf 是 antirez 的 C 库（GGUF 解析），gcc 直接编
 # - 产物统一放 build/（根 .gitignore 已忽略），源码目录保持干净
 # - CUDA 工具链在 /usr/local/cuda（本机 13.0，A100 机同路径）
@@ -21,10 +21,8 @@ NVCCFLAGS := -std=c++17 -O0 -g -arch=sm_80 -I. -x cu -Xcompiler -Wall
 BIN   := build/backend
 SRCS  := main.cpp scheduler.cpp protocol.cpp cache.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
-CUSRS := $(wildcard kernel/*.cu)                  # kernel 源，新增 .cu 免改本行
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \
-         $(patsubst %.c,build/%.o,$(CSRCS))
-CUOBJS := $(patsubst kernel/%.cu,build/kernel/%.o,$(CUSRS))
+         build/kernel/prefill.o $(patsubst %.c,build/%.o,$(CSRCS))
 DEPS  := $(OBJS:.o=.d)
 
 $(BIN): $(OBJS)
@@ -43,8 +41,8 @@ build/vt/vt_cuda.o: vt/vt_cuda.cpp vt/vt_cuda.hpp vt/vt.hpp
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-# kernel/*.cu：kernel 对象，头文件依赖手写（同上，nvcc 不走 -MMD）
-build/kernel/%.o: kernel/%.cu kernel/cuda_kernels.cuh
+# kernel/prefill.o：同上——nvcc -x cu，头文件依赖手写
+build/kernel/prefill.o: kernel/prefill.cpp kernel/index.h
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
@@ -69,14 +67,6 @@ cache_test: build/cache_test
 test: build/scheduler_test
 	build/scheduler_test
 
-# kernel 对拍测试（要 GPU；golden 默认路径按 backend/ cwd 相对，同 main.cpp
-# 的剧本约定）。跑法：make ktest
-build/ktest: kernel/ktest.cpp $(CUOBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart
-
-ktest: build/ktest
-	./build/ktest
-
 -include $(DEPS)
 
-.PHONY: clean test ktest
+.PHONY: clean test

@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "scheduler.h"
+#include "kernel/index.h"
 
 namespace myllm {
 
@@ -163,14 +164,11 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
         state_ = SchedulerState::CHUNKED;
     }
 
-    exec_device(env);
-}
-
-void Scheduler::exec_device(CudaEnv* env) {
     if (cudaStreamWaitEvent(staff_.execStream, staff_.h2dEvent, 0) != cudaSuccess) {
-        vt_panic("exec_device: wait on h2dEvent failed");
+        vt_panic("push_device: execStream wait on h2dEvent failed");
     }
 
+    kern::do_prefill(env, staff_.inputLeft, staff_.inputRight);
 }
 
 void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {
