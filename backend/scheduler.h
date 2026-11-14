@@ -24,8 +24,11 @@ struct SchedulerConfig {
 // 工作台三词：指向剧本 host.alloc 的锁页块（Mapped，host 与 kernel 都可
 // 直接 deref）。push_device 写入，beat_device/kernel 按拍推进
 struct SchedulerStaff {
-    cudaStream_t h2dStream = nullptr;   // 镜像 → device 整块搬运流（stream 0，与计算同流即同序）
+    cudaStream_t h2dStream = nullptr;   // 镜像 → device 整块搬运流（stream 0）
     cudaStream_t d2hStream = nullptr;   // device → 镜像落账搬运流（stream 1，落账时启用）
+    cudaStream_t execStream = nullptr;  // 计算相关 stream 2
+    cudaEvent_t  h2dEvent = nullptr;    // 镜像 H2D 完成旗（event 0）：置位才准启动计算——
+                                        // h2d 与 exec 分属两流，跨流序靠它建立
 
     void* deviceSession = nullptr;  // session.cuda：device 侧 slab 基址（H2D 目的）
     void* allSessions = nullptr;    // 指向 savedSessions 开始内存地址（HOST）
@@ -61,21 +64,22 @@ public:
 
 protected:
     void init_config(CudaEnv* env);
-    
+
     void beat_device(CudaEnv* env); // 在途的 worker_ ，持续工作
     void push_device(CudaEnv* env, UserMsg& m); // 新的用户消息到达
     void pull_device(CudaEnv* env, AbortMsg& m); // 结束指定的 worker_
     void stop_device(CudaEnv* env); // 彻底结束计算
+    void exec_device(CudaEnv* env); // execStream 上发射一拍前向（不等待）
 
 private:
     SchedulerState state_ = SchedulerState::IDLE;
     SchedulerConfig cfg_;
     SessionCache cache_;
     SchedulerStaff staff_;
-    
+
     SessionWorker worker_;
 
-    
+
 
     FdLines io_;          // 协议信道：next() 读协议行（查询式）、write_all() 写出口整段
 };

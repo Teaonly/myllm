@@ -23,8 +23,11 @@ void Scheduler::init_config(CudaEnv* env) {
 
     cache_.reset( cfg_.savedSessions );
 
+    // 流/事件从 build_vt_cuda 出厂池里领（默认 3 流 3 事件，见 vt_cuda.hpp）
     staff_.h2dStream = env->ctx()->stream(0);
     staff_.d2hStream = env->ctx()->stream(1);
+    staff_.execStream = env->ctx()->stream(2);   // 计算流：kernel 发射落点
+    staff_.h2dEvent = env->ctx()->event(0);      // 镜像 H2D 完成旗：置位才准启动计算
 
     // 工作台指针就位：直接指向剧本 host.alloc 的锁页块。
     // find_tensor 拿 shared_ptr<CudaTensor>，data() 是 void*（host 块 = mapped 主机地址）
@@ -144,7 +147,11 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
                             cudaMemcpyHostToDevice, staff_.h2dStream) != cudaSuccess) {
             vt_panic("push_device: session slab H2D failed");
         }
+        if (cudaEventRecord(staff_.h2dEvent, staff_.h2dStream) != cudaSuccess) {
+            vt_panic("push_device: H2D event record failed");
+        }
         *staff_.targetSession = target;    // 搬运已入队才记账：设备确实将有这份状态
+
     }
 
     // 余量超过一个 chunk（CS）才需要 CHUNKING 逐拍喂；一拍吃得下直接
@@ -155,6 +162,15 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     } else {
         state_ = SchedulerState::CHUNKED;
     }
+
+    exec_device(env);
+}
+
+void Scheduler::exec_device(CudaEnv* env) {
+    if (cudaStreamWaitEvent(staff_.execStream, staff_.h2dEvent, 0) != cudaSuccess) {
+        vt_panic("exec_device: wait on h2dEvent failed");
+    }
+
 }
 
 void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {
