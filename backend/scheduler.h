@@ -9,6 +9,7 @@
 #include "opt/fdline.h"      // FdLines：stdin/stdout 协议信道（读查询式 + 写整段必达）
 #include "protocol.h"
 #include "vt/vt_cuda.hpp"    // CudaEnv = vt::Enviroment<CudaTensor, CudaContext>
+#include "cache.h"
 
 namespace myllm {
 // 从 vt 环境中读取填充
@@ -44,6 +45,7 @@ protected:
 
 private:
     SchedulerConfig cfg_;
+    SessionCache cache_;
     std::optional<Session> worker_;
     FdLines io_;          // 协议信道：next() 读协议行（查询式）、write_all() 写出口整段
 };

@@ -19,7 +19,7 @@ CFLAGS    := -O2 -Wall
 NVCCFLAGS := -std=c++17 -O0 -g -arch=sm_80 -I. -x cu -Xcompiler -Wall
 
 BIN   := build/backend
-SRCS  := main.cpp scheduler.cpp protocol.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
+SRCS  := main.cpp scheduler.cpp protocol.cpp cache.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
 CUSRS := $(wildcard kernel/*.cu)                  # kernel 源，新增 .cu 免改本行
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \
@@ -56,6 +56,15 @@ clean:
 build/scheduler_test: test/scheduler_test.cpp scheduler.cpp protocol.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^
+
+# SessionCache 单测（无 GPU）。跑法：make cache_test
+# （test 聚合暂被 scheduler_test 旧 API 滞后拖住，本目标独立可跑）
+build/cache_test: test/cache_test.cpp cache.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+cache_test: build/cache_test
+	build/cache_test
 
 test: build/scheduler_test
 	build/scheduler_test
