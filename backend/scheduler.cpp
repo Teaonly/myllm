@@ -19,16 +19,24 @@ void Scheduler::init_config(CudaEnv* env) {
     cfg_.maxContentLength = static_cast<int>(hash.find_number("MC"));
     cfg_.prefillChunkSize = static_cast<int>(hash.find_number("CS"));
     cfg_.savedSessions = static_cast<int>(hash.find_number("SS"));
-    cfg_.sessionSize = static_cast<int>(hash.find_number("SSIZE"));
+    cfg_.sessionSize = static_cast<int64_t>(hash.find_number("SSIZE"));
 
     cache_.reset( cfg_.savedSessions );
 
+    staff_.h2dStream = env->ctx()->stream(0);
+    staff_.d2hStream = env->ctx()->stream(1);
+
     // 工作台指针就位：直接指向剧本 host.alloc 的锁页块。
     // find_tensor 拿 shared_ptr<CudaTensor>，data() 是 void*（host 块 = mapped 主机地址）
+    staff_.deviceSession = hash.find_tensor("session.cuda")->data();
     staff_.allSessions = hash.find_tensor("staff.sessions")->data();
     staff_.targetSession = static_cast<int*>(hash.find_tensor("staff.targetSession")->data());
     staff_.inputLeft     = static_cast<int*>(hash.find_tensor("staff.inputLeft")->data());
     staff_.inputRight    = static_cast<int*>(hash.find_tensor("staff.inputRight")->data());
+
+    // -1 = 设备尚不持有任何槽：开机时 session.cuda 是 cudaMalloc 的垃圾，
+    // 首笔会话（即便 target 恰为 0）也会因 != 触发整块 H2D，杜绝跳拷
+    *staff_.targetSession = -1;
 }
 
 int Scheduler::run(CudaEnv* env) {
@@ -122,11 +130,22 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     // 全新对话（matched == 0）从零算；命中（matched > 0）时前 matched 个
     // token 已在镜像里算过——两种情形统一成输入窗口 [matched, prompt 末)，
     // 喂入游标 inputLeft 从 matched 起步，免重算那段
-    *staff_.targetSession = target;
     *staff_.inputLeft = matched;
     *staff_.inputRight = (int)worker_.input_ids.size();
 
-    
+
+    // 镜像槽基址 = staff.sessions + SSIZE × target：ids 区在槽首（偏移 0），
+    // 新 prompt 先落镜像（H2D 集散地）；[0,matched) 段重写同值，无害
+    char* slot = static_cast<char*>(staff_.allSessions) + cfg_.sessionSize * target;
+    std::memcpy(slot, worker_.input_ids.data(), worker_.input_ids.size() * sizeof(int32_t));
+
+    if (*staff_.targetSession != target) {
+        if (cudaMemcpyAsync(staff_.deviceSession, slot, cfg_.sessionSize,
+                            cudaMemcpyHostToDevice, staff_.h2dStream) != cudaSuccess) {
+            vt_panic("push_device: session slab H2D failed");
+        }
+        *staff_.targetSession = target;    // 搬运已入队才记账：设备确实将有这份状态
+    }
 
     // 余量超过一个 chunk（CS）才需要 CHUNKING 逐拍喂；一拍吃得下直接
     // CHUNKED——下一拍 drain 即出首 token。（注意是解引用相减：两指针
@@ -136,7 +155,6 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     } else {
         state_ = SchedulerState::CHUNKED;
     }
-    
 }
 
 void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {

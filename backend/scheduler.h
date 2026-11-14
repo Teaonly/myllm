@@ -17,12 +17,17 @@ struct SchedulerConfig {
     int maxContentLength;         // 剧本 "MC"（128000）：准入上限 = KV 池容量
     int prefillChunkSize;         // 剧本 "CS"（2048）：长 prefill 的分块步长
     int savedSessions;            // 剧本 "SS"（4）：主机 LRU 住的 Session 内存数目
-    int sessionSize;              // 剧本 "SSIZE"：一个 Session 状态块的字节数（session.cuda 尺寸）
+    int64_t sessionSize;          // 剧本 "SSIZE"：一个 Session 状态块的字节数（slab ~3G，
+                                  // 超 int 上限 2^31，必须 64 位——槽位偏移乘法同此）
 };
 
 // 工作台三词：指向剧本 host.alloc 的锁页块（Mapped，host 与 kernel 都可
 // 直接 deref）。push_device 写入，beat_device/kernel 按拍推进
 struct SchedulerStaff {
+    cudaStream_t h2dStream = nullptr;   // 镜像 → device 整块搬运流（stream 0，与计算同流即同序）
+    cudaStream_t d2hStream = nullptr;   // device → 镜像落账搬运流（stream 1，落账时启用）
+
+    void* deviceSession = nullptr;  // session.cuda：device 侧 slab 基址（H2D 目的）
     void* allSessions = nullptr;    // 指向 savedSessions 开始内存地址（HOST）
     int* targetSession = nullptr;   // 命中的镜像槽位：恢复镜像/落回同槽都认它
     int* inputLeft = nullptr;       // 输入窗口左沿（绝对坐标）：待喂入游标 = 已算过数

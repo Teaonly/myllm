@@ -88,4 +88,4 @@ struct CudaTensor : vt::TensorType {
 //   n_streams  要创建的流数（cuda.set_stream 的可选下标范围）
 //   n_events   要创建的事件数（跨流同步用）
 using CudaEnv = vt::Enviroment<CudaTensor, CudaContext>;
-CudaEnv* build_vt_cuda(int n_streams = 2, int n_events = 2);
+CudaEnv* build_vt_cuda(int n_streams = 3, int n_events = 3);
