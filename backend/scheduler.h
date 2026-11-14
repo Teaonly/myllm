@@ -21,8 +21,8 @@ struct SchedulerConfig {
                                   // 超 int 上限 2^31，必须 64 位——槽位偏移乘法同此）
 };
 
-// 工作台三词：指向剧本 host.alloc 的锁页块（Mapped，host 与 kernel 都可
-// 直接 deref）。push_device 写入，beat_device/kernel 按拍推进
+// 工作台（staff.*）：剧本 host.alloc 的锁页块（Mapped，host 与 kernel 都
+// 可直接 deref）。入三词 host→device 方向，出三词 device→host 方向
 struct SchedulerStaff {
     cudaStream_t h2dStream = nullptr;   // 镜像 → device 整块搬运流（stream 0）
     cudaStream_t d2hStream = nullptr;   // device → 镜像落账搬运流（stream 1，落账时启用）
@@ -32,9 +32,15 @@ struct SchedulerStaff {
 
     void* deviceSession = nullptr;  // session.cuda：device 侧 slab 基址（H2D 目的）
     void* allSessions = nullptr;    // 指向 savedSessions 开始内存地址（HOST）
-    int* targetSession = nullptr;   // 命中的镜像槽位：恢复镜像/落回同槽都认它
-    int* inputLeft = nullptr;       // 输入窗口左沿（绝对坐标）：待喂入游标 = 已算过数
-    int* inputRight = nullptr;      // 输入窗口右沿（绝对坐标）：prompt 末 = one-past-end
+    // 标量同步词一律 volatile int*：对端 kernel 经 PCIe 直接改写 mapped 锁页
+    // 内存，编译器不得把值缓进寄存器——轮询/读写每次都必须真发 load/store
+    volatile int* targetSession = nullptr;   // 命中的镜像槽位：恢复镜像/落回同槽都认它
+    volatile int* inputLeft = nullptr;       // 输入窗口左沿（绝对坐标）：待喂入游标 = 已算过数
+    volatile int* inputRight = nullptr;      // 输入窗口右沿（绝对坐标）：prompt 末 = one-past-end
+
+    volatile int* outputTokens = nullptr;    // kernel 写出的 token 队列（16 词出口缓冲）
+    volatile int* outputNumber = nullptr;    // 本批写出的 token 数（kernel 写，host 收割）
+    volatile int* outputCmd = nullptr;       // 出口侧命令字（预留）
 };
 
 // 单流调度的状态

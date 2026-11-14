@@ -38,6 +38,11 @@ void Scheduler::init_config(CudaEnv* env) {
     staff_.inputLeft     = static_cast<int*>(hash.find_tensor("staff.inputLeft")->data());
     staff_.inputRight    = static_cast<int*>(hash.find_tensor("staff.inputRight")->data());
 
+    // 出口侧三词：kernel 写 token/数目，host 在 beat_device 里收割
+    staff_.outputTokens = static_cast<int*>(hash.find_tensor("staff.outputTokens")->data());
+    staff_.outputNumber = static_cast<int*>(hash.find_tensor("staff.outputNumber")->data());
+    staff_.outputCmd    = static_cast<int*>(hash.find_tensor("staff.outputCmd")->data());
+
     // -1 = 设备尚不持有任何槽：开机时 session.cuda 是 cudaMalloc 的垃圾，
     // 首笔会话（即便 target 恰为 0）也会因 != 触发整块 H2D，杜绝跳拷
     *staff_.targetSession = -1;
@@ -167,8 +172,11 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     if (cudaStreamWaitEvent(staff_.execStream, staff_.h2dEvent, 0) != cudaSuccess) {
         vt_panic("push_device: execStream wait on h2dEvent failed");
     }
-
-    kern::do_prefill(env, staff_.inputLeft, staff_.inputRight);
+    if (state_ == SchedulerState::CHUNKING) {
+        kern::do_prefill_chunking(env, staff_.inputLeft, staff_.inputRight);
+    } else {
+        kern::do_prefill_chunked(env, staff_.inputLeft, staff_.inputRight);
+    }
 }
 
 void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {
@@ -192,8 +200,7 @@ void Scheduler::beat_device(CudaEnv* env) {
         return;
     }
 
-    // 接下来才是真实工作：CHUNKING 每拍喂 ≤CS 个 token（inputLeft 前进）、
-    // 喂完转 CHUNKED 出首 token、再转 DECODING 逐拍生成回填
+    
 
     return;
 }

@@ -4,7 +4,11 @@
 
 namespace kern {
 
-void do_prefill(CudaEnv* env, const int* left, const int* right) {
+void do_prefill_chunking(CudaEnv* env, volatile int* left, volatile int* right) {
+    return;
+}
+
+void do_prefill_chunked(CudaEnv* env, volatile int* left, volatile int* right) {
     return;
 }
 
