@@ -17,6 +17,7 @@ struct SchedulerConfig {
     int maxContentLength;         // 剧本 "MC"（128000）：准入上限 = KV 池容量
     int prefillChunkSize;         // 剧本 "CS"（2048）：长 prefill 的分块步长
     int savedSessions;            // 剧本 "SS"（4）：主机 LRU 住的 Session 内存数目
+    int sessionSize;              // 剧本 "SSIZE"：一个 Session 状态块的字节数（session.cuda 尺寸）
 };
 
 struct Session {

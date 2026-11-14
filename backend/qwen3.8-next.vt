@@ -350,7 +350,7 @@
 
 
 2048    "CS"  !    ; Prefill Chunk Size
-128000  "MC"  !    ; 最大上下文长度
+131072  "MC"  !    ; 最大上下文长度，128K
 1       'DT'  !    ; decode 每步 token 数（投机解码接入时可调大）
 4       "SS"  !    ; CPU 上保存最新四份 Session 计算状态
 
@@ -487,43 +487,32 @@
 
 0 'offset' !
 
+; 必须是起始，Host直接用0地址写数据
 "session.cuda" @ 'offset' @
-    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'kv.K' !    ; (QL, MC, KW) K 池
+    'MC' @ 4 * cuda.view 'cache.ids' !                       
+'offset' @ 'MC' @ 4 * + 'offset' ! 
+
+"session.cuda" @ 'offset' @
+    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'cache.K' !    ; (QL, MC, KW) K 池
 'offset' @ 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * + 'offset' !   ; offset += 一池字节
 
 "session.cuda" @ 'offset' @
-    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'kv.V' !    ; (QL, MC, KW) V 池
+    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'cache.V' !    ; (QL, MC, KW) V 池
 'offset' @ 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * + 'offset' !   ; 后续 GDN/QSA 状态接着排
 
 'offset' !!                                                  ; 临时量出hash：后续状态接着排时再立
 
 ; 主机端配置多分Session内存，届时一次 H2D 复制完成
 "session.cuda" @ tensor.size "SS" @ * host.alloc "session.host" !
+"session.cuda" @ tensor.size "SSIZE" !
 
 ; ============================================================================
-; 同步内存 —— host↔device 控制块，双胞胎两块同布局（临时状态）：
-;   sync.cuda   显存块：device 侧真身，kernel 直读 tokens、直写 next
-;   sync.host   pinned 镜像：host 的读写落点，与 sync.cuda 间 tensor.copy 搬运
+; 同步内存 —— host↔device 采用
+; 
 ; ============================================================================
-; 布局（两块同构）：(MC+5) 个 int32 = tokens 队列本体 + 5 字头。单会话、绝对
-; 坐标、每字单写者（无锁）：
-;   tokens[0..MC)      待算 token 队列：prompt 到达、生成回填都落这里；
-;                      backlog = tail - head
-;   tokens[MC+0] head  第一个未计算 token 的绝对位（H2D）。三重身份：QSA KV
-;                      写入槽位号 = rope 偏移 = GDN 已吃进数
-;   tokens[MC+1] tail  下一个新 token 落点，one-past-end（H2D）——不是"最后
-;                      一个"：闭区间语义与回填落点各差一
-;   tokens[MC+2] next  drain 拍 argmax 出的 token id（D2H）——vocab 下标不是
-;                      位置：host 判 EOS、写协议行、回填全靠它
-;   tokens[MC+3] flag  后续安排
-;   tokens[MC+4] cmd   后续安排
-; 初值（含清零）host 写在 sync.host 再 H2D——两块内容都不保证清零。
-; 定案备忘：改回单块 pinned（UVA 下 device 可直接 deref）可省逐拍搬运，
-; overlap 重写时二选一。
-; ============================================================================
-
-'MC' @ 5 + 4 * cuda.alloc 'sync.cuda' !              ; tokens[MC] + 5 字头
-'sync.cuda' @ tensor.size host.alloc "sync.host" !   ; 对应的 H2D/D2H 的目标
+16 * 4 host.alloc "tokens"
+8 * 4  host.alloc "flags"
+8 * 4  host.alloc "cmds"
 
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
