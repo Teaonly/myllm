@@ -477,67 +477,54 @@
 
 ; ============================================================================
 ; Session 常驻状态 —— 单 session、最大 MC=128000，跨 chunk/token 持久
-; （大小只跟 MC 走，与 CS/DT 无关；decode 注释里说的递归状态就是这一节）
-; 总账(MC=128000)：KV 2.93 GiB + idx 188 MiB + rope 31 MiB + GDN 118 MB + PLE ≈640 KiB ≈ 3.27 GiB
 ; ============================================================================
 
 ; ---- QSA KV cache（12 层）----
-; K+V = 2×12×128000×512×KVE；KVE=2(FP16)→2.93 GiB。卡紧改 KVE=1（INT8、
-; per-64 fp16 scale 另计）省 1.46 GiB；Q4_0+Hadamard 约 1/4，见 Strata kv_q4
 2 'KVE' !    ; KV 元素字节：2=FP16（默认）
 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.K' !    ; (QL, MC, KW) K 池
 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.V' !    ; (QL, MC, KW) V 池
 
-; ---- indexer 池化键 + 填充尾 + rope 表（全 QSA 层共享一份 rope）----
-'QL' @ 'MC' @ 'IB' @ / 2 + * 'ID' @ * 4 * cuda.alloc 'kv.idx' !      ; (QL, MC/IB+2, ID) f32 ≈188 MiB
-'QL' @ 'IB' @ 1 - * 'ID' @ * 4 *     cuda.alloc 'kv.idxtail' !       ; (QL, IB-1, ID) 填充中块的原始尾
-'MC' @ 32 * 4 * cuda.alloc 'qsa.cos' !    ; rope cos (MC, n_rot/2)，host float64 建表存 f32
-'MC' @ 32 * 4 * cuda.alloc 'qsa.sin' !    ; rope sin
-
-; ---- GDN 递归状态（36 层；turn checkpoint 的主体，≈118 MB，与 Strata 实测同量级）----
-'GL' @ 'S'  @ * 'VH' @ * 'S' @ * 4 * cuda.alloc 'gdn.S'    !  ; (GL, S, VH, S) f32 ≈108 MiB；注意是引擎
-                                                                    ; 转置布局（key维,头,value维)，参考实
-                                                                    ; 现是 (S,S,VH)，写 kernel 勿混
-'GL' @ 'C'  @ * 3 * 4 *            cuda.alloc 'gdn.conv'  !  ; (GL, C, d_conv-1) f32 ≈4 MiB
-
-; ---- PLE 会话态（hist 是 PLE 在 session 区的全部递归状态，≈640 KiB 总）----
-9 'NGH' !    ; 历史行数 = (conv_kernel-1)×ngram_size = 3×3；ple.cu/ple.hpp 的 NG_HIST
-'NGH' @ 'D' @ * 4 * cuda.alloc 'ple.hist' !    ; (9, 10240) f32 = 360 KiB。行最快 hist[r+NGH*c]
-                                                ; （≠ gdn.S 的转置方向！ggml_reshape_3d ne0=行），oldest-
-                                                ; first，存 RMSNorm 后的规一化行；会话起始清零，每 token
-                                                ; shift 一行 + append 到第 8 行（ple_history_advance 原地）
-'N' @ 4 * host.alloc 'ple.embh' !              ; gather 出的 2560 宽行，host 暂存
-'N' @ 4 * cuda.alloc 'ple.embd' !              ; 同行上设备（ple_block 的 emb 入参）
-5 'D' @ * 'N' @ + 4 + 4 * 'N' @ 32 / 34 * + 'N' @ 2 * + 256 + 'D' @ 4 * +
-cuda.alloc 'ple.scratch' !                     ; 264,112 B = ple_block 的 223,152（5×hc_dim+n_embd+hc 的
-                                                ; f32 + Q8 激活像 + bf16 embedding 像，各 16 对齐）+ 规一化
-                                                ; 导出行 D×4（落在 scratch+223152 偏移，advance 的输入，
-                                                ; 须与 hist 不相交）。kernel 里勿在 capture 中 malloc
-
 ; ============================================================================
 ; Session CPU 备份 —— GPU 侧递归态的 host 镜像，SS=4 份（'SS' @ 在 hash）
 ; 新提示词来了找最长可复用前缀命中的那份，tensor.copy 整份恢复回 GPU，
-; 省掉重 prefill。快照/恢复各是每张量一条 tensor.copy（D2H / H2D）+ cuda.sync
-;
-; 镜像 7 块（= GPU 侧全部会话递归态）：
-;   kv.K kv.V kv.idx kv.idxtail gdn.S gdn.conv ple.hist
-; 不镜像：qsa.cos/sin（静态 rope 表，启动建一次不随会话变）、
-;   ple.embh/embd/scratch 与 pf.*/dec.*（每 token / 每 chunk 暂存，重算不值钱）
-; 每份 ≈3.24 GiB（KV 2.93 + idx 0.18 + GDN 0.12 + idxtail/ple.hist 零头），
-; ×4 ≈13 GiB 锁页——本机 62G RAM 可容；SS 调大先算这笔账
-;
-; %for 边界只能写字面量（0..SS-1），SS 改了这里跟着改
 ; ============================================================================
 
 %for 0 3
 'kv.K'       @ tensor.size host.alloc 'bak.%%.kv.K'       !
 'kv.V'       @ tensor.size host.alloc 'bak.%%.kv.V'       !
-'kv.idx'     @ tensor.size host.alloc 'bak.%%.kv.idx'     !
-'kv.idxtail' @ tensor.size host.alloc 'bak.%%.kv.idxtail' !
-'gdn.S'      @ tensor.size host.alloc 'bak.%%.gdn.S'      !
-'gdn.conv'   @ tensor.size host.alloc 'bak.%%.gdn.conv'   !
-'ple.hist'   @ tensor.size host.alloc 'bak.%%.ple.hist'   !
 %endf
+
+; ============================================================================
+; 同步内存 —— host↔device 共享控制块，一块 pinned（host.alloc / cudaHostAlloc）：
+; host 直见，UVA 下 device 内核直接 deref 同一指针。不做 dev/host 双胞胎两块——
+; cuda.alloc 的显存 host 看不见，那就只能逐拍搬字同步；控制块每拍就几十字节，
+; 零拷贝直读直写才是它的本职。
+; ============================================================================
+; 布局：一块 (MC+5) 个 int32 = tokens 队列本体 + 5 字头。单会话、绝对坐标、
+; 每字单写者（无锁）：
+;   sync.tokens  tokens[0..MC)   待算 token 队列            host 写 / device 读
+;                               prompt 到达、生成回填都落这里；backlog = tail - head
+;   sync.head    tokens[MC+0]    第一个未计算 token 的绝对位（输入）
+;   sync.tail    tokens[MC+1]    下一个新 token 落点，one-past-end（输入）
+;   sync.next    tokens[MC+2]    drain 拍 argmax 出的 token id（输出）
+;                               vocab 下标，不是位置：host 判 EOS、写协议行、回填
+;                               队列全靠它；位置 host 自己有（= 当拍 head）
+;   sync.flag    tokens[MC+3]    后续安排
+;   sync.cmd     tokens[MC+4]    后续安排
+; 头部初值（含清零）由 host 在会话建立时写——pinned 内容不保证清零。
+; ============================================================================
+
+'MC' @ 5 + 4 * host.alloc 'sync' !         ; tokens[MC] + 5 字头，一块 pinned
+'MC' @ 4 * 'MCB' !                         ; MCB = MC*4：字头距块首的字节偏移
+'sync' @ 0        'MCB' @       cuda.view 'sync.tokens' !  ; 队列本体 tokens[0..MC)
+'sync' @ 'MCB' @                4 cuda.view 'sync.head'  !  ; [MC+0]
+'sync' @ 'MCB' @ 4       +      4 cuda.view 'sync.tail'  !  ; [MC+1]
+'sync' @ 'MCB' @ 8       +      4 cuda.view 'sync.next'  !  ; [MC+2]
+'sync' @ 'MCB' @ 12      +      4 cuda.view 'sync.flag'  !  ; [MC+3]
+'sync' @ 'MCB' @ 16      +      4 cuda.view 'sync.cmd'   !  ; [MC+4]
+
+'sync' @ tensor.size cuda.alloc "sync.cuda" !   ; 对应的 H2D 的目标
+
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop

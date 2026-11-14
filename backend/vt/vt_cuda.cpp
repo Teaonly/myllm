@@ -276,9 +276,11 @@ struct SetStreamWord : vt::NativeWord<CudaTensor> {
 // ---------------------------------------------------------------------------
 // 4. 组装出厂
 
-CudaEnv* build_vt_cuda() {
-    // 进程级单例：ctx 放静态区（资源随进程销毁），env 堆上常驻不回收
-    static CudaContext ctx(0, 2, 2);    // 设备/流数/事件数：最终拓扑定案时改这里
+CudaEnv* build_vt_cuda(int n_streams, int n_events) {
+    // 进程级单例：ctx 放静态区（资源随进程销毁），env 堆上常驻不回收。
+    // static 只在首次调用时构造，所以流数/事件数由首个调用者定下；
+    // 设备号仍固定 0（要多卡开多个 vt 实例，见 vt_cuda.hpp 头注）
+    static CudaContext ctx(0, n_streams, n_events);
     auto* env = new CudaEnv(&ctx);
 
     // CUDA 层词表

@@ -84,5 +84,7 @@ struct CudaTensor : vt::TensorType {
 // ---------------------------------------------------------------------------
 // 组装出厂：new 一个 Enviroment<CudaTensor, CudaContext>，注册 CUDA native 词，
 // 并把其他层（gguf 等）的词表也统统装上——一次调用拿到完整词表的 env。
+//   n_streams  要创建的流数（cuda.set_stream 的可选下标范围）
+//   n_events   要创建的事件数（跨流同步用）
 using CudaEnv = vt::Enviroment<CudaTensor, CudaContext>;
-CudaEnv* build_vt_cuda();       // 进程级单例：env/ctx 不 delete，随进程回收
+CudaEnv* build_vt_cuda(int n_streams = 2, int n_events = 2);
