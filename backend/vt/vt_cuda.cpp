@@ -73,13 +73,15 @@ static void* dev_alloc(int dev, size_t bytes) {
 }
 
 // 主机锁页内存（pinned）：H2D/D2H 拷贝直达，不经 runtime 的 staging 缓冲；
-// 不属于任何设备（UVA 下全设备可见），析构 cudaFreeHost 也不用切设备
+// 不属于任何设备（UVA 下全设备可见），析构 cudaFreeHost 也不用切设备。
+// 恒带 cudaHostAllocMapped：显式声明地址同时进设备空间——UVA 下与 Default
+// 行为等价（同指针，kernel 可直接 deref），Mapped 是意图标记 + 非 UVA 保险
 static void* host_alloc(size_t bytes) {
     if (bytes == 0) {
         return nullptr;
     }
     void* p = nullptr;
-    if (cudaHostAlloc(&p, bytes, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped) != cudaSuccess) {
         vt_panic("CudaTensor: cudaHostAlloc failed");
     }
     return p;
@@ -146,8 +148,10 @@ struct AllocWord : vt::NativeWord<CudaTensor> {
     }
 };
 
-// host.alloc：( n_bytes -- tensor ) 数 → 主机锁页内存块。cudaHostAlloc 不挑设备
-// （pinned 内存全设备可见），纯分配不需要 ctx，所以是 LR 形态
+// host.alloc：( n_bytes -- tensor ) 数 → 主机锁页内存块。cudaHostAlloc(Mapped)：
+// 地址同时进设备空间，kernel 拿 data() 直接 deref（同步控制块本命出身；
+// UVA 下与 Default 同指针等价，Mapped 是显式意图，见 host_alloc 注）。
+// 不挑设备，纯分配不需要 ctx，所以是 LR 形态
 struct HostAllocWord : vt::NativeWord<CudaTensor> {
     static vt::NativeWord<CudaTensor>* creator(CudaEnv&) { return new HostAllocWord(); }
 

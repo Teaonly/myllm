@@ -51,7 +51,8 @@ private:
 // 字段构造即定型：data_ 是 const 指针（指针不变、内容可写），
 // kernel 侧拿去 cast 成目标类型直接用。
 // 真身有两种出身：设备显存（cudaMalloc 所得、析构 cudaFree）与主机锁页内存
-// （cudaHostAlloc 所得、析构 cudaFreeHost——pinned，H2D/D2H 直达不经 staging）。
+// （cudaHostAlloc 所得、析构 cudaFreeHost——pinned，H2D/D2H 直达不经 staging；
+// 恒带 cudaHostAllocMapped：地址映射进设备空间，UVA 下同一指针 kernel 直接 deref）。
 // 第三种是 view：在真身上偏移切片，不拥有内存、析构不释放。owner_ 钉住
 // 真身的生命周期：view 活着真身就不会被释放，借来的地址永远有效，内存保证不出错。
 struct CudaTensor : vt::TensorType {
@@ -64,7 +65,7 @@ struct CudaTensor : vt::TensorType {
 
     // 真身（设备显存）：构造即在指定设备上分配 dev_size 字节（内容未初始化）；析构 cudaFree
     CudaTensor(int dev, size_t dev_size);
-    // 真身（主机锁页内存）：cudaHostAlloc 分配 host_size 字节；析构 cudaFreeHost
+    // 真身（主机锁页内存）：cudaHostAlloc(Mapped) 分配 host_size 字节；析构 cudaFreeHost
     CudaTensor(size_t host_size);
     // view：不分配，在真身上偏移 offset 切 view_size 字节
     CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t view_size);
