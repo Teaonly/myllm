@@ -18,6 +18,7 @@ void Scheduler::init_config(CudaEnv* env) {
     auto& hash = env->hash();
     cfg_.maxContentLength = static_cast<int>(hash.find_number("MC"));
     cfg_.prefillChunkSize = static_cast<int>(hash.find_number("CS"));
+    cfg_.savedSessions = static_cast<int>(hash.find_number("SS"));
 }
 
 int Scheduler::run(CudaEnv* env) {

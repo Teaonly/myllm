@@ -481,49 +481,49 @@
 
 ; ---- QSA KV cache（12 层）----
 2 'KVE' !    ; KV 元素字节：2=FP16（默认）
-'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.K' !    ; (QL, MC, KW) K 池
-'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.alloc 'kv.V' !    ; (QL, MC, KW) V 池
+
+;; 整片的Session相关内存，依次 View ，先创建 4G ，不够增加
+4 1024 * 1024 * 1024 * cuda.alloc "session.cuda" !
+
+0 'offset' !
+
+"session.cuda" @ 'offset' @
+    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'kv.K' !    ; (QL, MC, KW) K 池
+'offset' @ 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * + 'offset' !   ; offset += 一池字节
+
+"session.cuda" @ 'offset' @
+    'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'kv.V' !    ; (QL, MC, KW) V 池
+'offset' @ 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * + 'offset' !   ; 后续 GDN/QSA 状态接着排
+
+'offset' !!                                                  ; 临时量出hash：后续状态接着排时再立
+
+; 主机端配置多分Session内存，届时一次 H2D 复制完成
+"session.cuda" @ tensor.size "SS" @ * host.alloc "session.host" !
 
 ; ============================================================================
-; Session CPU 备份 —— GPU 侧递归态的 host 镜像，SS=4 份（'SS' @ 在 hash）
-; 新提示词来了找最长可复用前缀命中的那份，tensor.copy 整份恢复回 GPU，
+; 同步内存 —— host↔device 控制块，双胞胎两块同布局（临时状态）：
+;   sync.cuda   显存块：device 侧真身，kernel 直读 tokens、直写 next
+;   sync.host   pinned 镜像：host 的读写落点，与 sync.cuda 间 tensor.copy 搬运
+; ============================================================================
+; 布局（两块同构）：(MC+5) 个 int32 = tokens 队列本体 + 5 字头。单会话、绝对
+; 坐标、每字单写者（无锁）：
+;   tokens[0..MC)      待算 token 队列：prompt 到达、生成回填都落这里；
+;                      backlog = tail - head
+;   tokens[MC+0] head  第一个未计算 token 的绝对位（H2D）。三重身份：QSA KV
+;                      写入槽位号 = rope 偏移 = GDN 已吃进数
+;   tokens[MC+1] tail  下一个新 token 落点，one-past-end（H2D）——不是"最后
+;                      一个"：闭区间语义与回填落点各差一
+;   tokens[MC+2] next  drain 拍 argmax 出的 token id（D2H）——vocab 下标不是
+;                      位置：host 判 EOS、写协议行、回填全靠它
+;   tokens[MC+3] flag  后续安排
+;   tokens[MC+4] cmd   后续安排
+; 初值（含清零）host 写在 sync.host 再 H2D——两块内容都不保证清零。
+; 定案备忘：改回单块 pinned（UVA 下 device 可直接 deref）可省逐拍搬运，
+; overlap 重写时二选一。
 ; ============================================================================
 
-%for 0 3
-'kv.K'       @ tensor.size host.alloc 'bak.%%.kv.K'       !
-'kv.V'       @ tensor.size host.alloc 'bak.%%.kv.V'       !
-%endf
-
-; ============================================================================
-; 同步内存 —— host↔device 共享控制块，一块 pinned（host.alloc / cudaHostAlloc）：
-; host 直见，UVA 下 device 内核直接 deref 同一指针。不做 dev/host 双胞胎两块——
-; cuda.alloc 的显存 host 看不见，那就只能逐拍搬字同步；控制块每拍就几十字节，
-; 零拷贝直读直写才是它的本职。
-; ============================================================================
-; 布局：一块 (MC+5) 个 int32 = tokens 队列本体 + 5 字头。单会话、绝对坐标、
-; 每字单写者（无锁）：
-;   sync.tokens  tokens[0..MC)   待算 token 队列            host 写 / device 读
-;                               prompt 到达、生成回填都落这里；backlog = tail - head
-;   sync.head    tokens[MC+0]    第一个未计算 token 的绝对位（输入）
-;   sync.tail    tokens[MC+1]    下一个新 token 落点，one-past-end（输入）
-;   sync.next    tokens[MC+2]    drain 拍 argmax 出的 token id（输出）
-;                               vocab 下标，不是位置：host 判 EOS、写协议行、回填
-;                               队列全靠它；位置 host 自己有（= 当拍 head）
-;   sync.flag    tokens[MC+3]    后续安排
-;   sync.cmd     tokens[MC+4]    后续安排
-; 头部初值（含清零）由 host 在会话建立时写——pinned 内容不保证清零。
-; ============================================================================
-
-'MC' @ 5 + 4 * host.alloc 'sync' !         ; tokens[MC] + 5 字头，一块 pinned
-'MC' @ 4 * 'MCB' !                         ; MCB = MC*4：字头距块首的字节偏移
-'sync' @ 0        'MCB' @       cuda.view 'sync.tokens' !  ; 队列本体 tokens[0..MC)
-'sync' @ 'MCB' @                4 cuda.view 'sync.head'  !  ; [MC+0]
-'sync' @ 'MCB' @ 4       +      4 cuda.view 'sync.tail'  !  ; [MC+1]
-'sync' @ 'MCB' @ 8       +      4 cuda.view 'sync.next'  !  ; [MC+2]
-'sync' @ 'MCB' @ 12      +      4 cuda.view 'sync.flag'  !  ; [MC+3]
-'sync' @ 'MCB' @ 16      +      4 cuda.view 'sync.cmd'   !  ; [MC+4]
-
-'sync' @ tensor.size cuda.alloc "sync.cuda" !   ; 对应的 H2D 的目标
+'MC' @ 5 + 4 * cuda.alloc 'sync.cuda' !              ; tokens[MC] + 5 字头
+'sync.cuda' @ tensor.size host.alloc "sync.host" !   ; 对应的 H2D/D2H 的目标
 
 
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----

@@ -15,6 +15,7 @@ namespace myllm {
 struct SchedulerConfig {
     int maxContentLength;         // 剧本 "MC"（128000）：准入上限 = KV 池容量
     int prefillChunkSize;         // 剧本 "CS"（2048）：长 prefill 的分块步长
+    int savedSessions;            // 剧本 "SS"（4）：主机 LRU 住的 Session 内存数目
 };
 
 struct Session {
@@ -22,8 +23,6 @@ struct Session {
     SamplingParams params;
     std::vector<int32_t> input_ids;
     std::vector<int32_t> output_ids;
-    int64_t fed = 0;       // prefill 进度：已喂进的输入 token 数
-    int32_t emitted = 0;   // decode 进度：已产出并写出的 token 数
 };
 
 class Scheduler {
