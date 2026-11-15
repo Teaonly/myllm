@@ -48,8 +48,16 @@ struct gguf_tensor_type_features {
     {"iq2_xxs", 256, 66},
     {"iq2_xs", 256, 74},
     {"iq3_xxs", 256, 98},
-    {"iq1_s", 256, 110},
-    {"iq4_nl", 256, 50},
+    {"iq1_s", 256, 50},    /* was {256,110}: same transcription slip as iq4_nl
+                            * below -- 110 is iq3_s's bytes, and the 50 that
+                            * belongs here had drifted into the iq4_nl row.
+                            * block_iq1_s = half d + qs[32] + qh[16] = 50 B
+                            * per 256 values (ggml-common.h:425). Unused by
+                            * the current pack; fixed for hygiene. */
+    {"iq4_nl", 32, 18},    /* was {256,50}: never exercised before the expert
+                              * tensors. Standard IQ4_NL is 18 B / 32 values
+                              * (block_iq4_nl), and the pack measures exactly
+                              * that: ffn_down_exps [640,2560,512] = 450.0 MiB. */
     {"iq3_s", 256, 110},
     {"iq2_s", 256, 82},
     {"iq4_xs", 256, 136},
@@ -60,6 +68,20 @@ struct gguf_tensor_type_features {
     {"f64", 1, 8},
     {"iq1_m", 256, 56},
     {"bf16", 1, 2},
+    /* 31..41: unused ids of the GSQ enum (iq1_m=29, bf16=30 here follow the
+     * pack's Strata-side numbering, not stock llama.cpp). {1,0} on purpose:
+     * sizing then yields bsize 0 ("unsized", same as an unknown type) instead
+     * of dividing by zero at the alignment/padding step. */
+    {"reserved", 1, 0}, {"reserved", 1, 0}, {"reserved", 1, 0},
+    {"reserved", 1, 0}, {"reserved", 1, 0}, {"reserved", 1, 0},
+    {"reserved", 1, 0}, {"reserved", 1, 0}, {"reserved", 1, 0},
+    {"reserved", 1, 0}, {"reserved", 1, 0},
+    /* GSQ-RCO custom expert type (Strata's extended type 42 = Q2_0):
+     * block_q2_0 in this pack's ggml is 18 B / 64 values (QK2_0 = 64, see
+     * Strata ggml-common.h:187) = 2.25 bpw; the pack measures exactly
+     * 225.0 MiB per [640,2560,512] down tensor. Decode stays future work
+     * (MoE kernel); this entry is for correct sizing only. */
+    {"q2_0", 64, 18},
 };
 
 /* Return the value type name given the type ID. */
