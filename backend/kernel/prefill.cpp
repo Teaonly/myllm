@@ -109,4 +109,8 @@ void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
     do_dummy(m.stream, m.outputCmd, 2);    // 占位层栈（分诊值：chunked=2）
 }
 
+void reset_session(CudaEnv* env, myllm::SchedulerStaff& staff, int target) {
+    // TODO ，清零相关矩阵
+}
+
 }  // namespace kern

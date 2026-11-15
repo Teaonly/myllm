@@ -137,6 +137,11 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     vt_assert(target >= 0, "target session must be valid");
     vt_assert(matched >= 0, "Matched length must be valid");
 
+    if (matched == 0) {
+        // 所有都未匹配，需要重置 Session GDN 中对应的内容
+        kern::reset_session(env, staff_, target);
+    }
+
     // 工作台开张，三词就位（kernel 侧同样直接 deref 这三个 mapped 字）：
     // 全新对话（matched == 0）从零算；命中（matched > 0）时前 matched 个
     // token 已在镜像里算过——两种情形统一成输入窗口 [matched, prompt 末)，

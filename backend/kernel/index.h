@@ -21,4 +21,6 @@ namespace kern {
 void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff);
 void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff);
 
+void reset_session(CudaEnv* env, myllm::SchedulerStaff& staff, target);
+
 }  // namespace kern
