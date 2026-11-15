@@ -432,48 +432,7 @@
 ; ============================================================================
 ; Decode 激活缓冲 —— cuda.view 从 prefill 缓冲借 T 行，零新增显存
 ; ============================================================================
-; prefill 与 decode 在同一 default stream 上先后执行（服务循环串行拍），decode
-; 每步的 scratch 直接切 prefill 块的首 'DT' 行视图，不另开显存；宽度公式与
-; pf.* 一一对应，只是 CS 换成 DT。
-; 每序列常驻的递归状态（GDN S / conv 状态 / QSA KV cache）不在此——见下方
-; "Session 常驻状态"一节（原设计文档 §10 的布局由该节落地）。
 
-; 残差栈 / 超连接
-'pf.R'      @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.R'      !  ; 残差栈行
-'pf.xn16'   @ 0 'DT' @ 'D'  @ * 2 * cuda.view 'dec.xn16'   !  ; norm 后 bf16 像
-'pf.lo'     @ 0 'DT' @ 'LR' @ * 4 * cuda.view 'dec.lo'     !  ; 低秩瓶颈
-'pf.lo16'   @ 0 'DT' @ 'LR' @ * 2 * cuda.view 'dec.lo16'   !  ; 低秩瓶颈 bf16 像
-'pf.gated'  @ 0 'DT' @ 'D'  @ * 4 * cuda.view 'dec.gated'  !  ; xn·sigmoid(gate)
-'pf.inj'    @ 0 'DT' @ 'HC' @ * 4 * cuda.view 'dec.inj'    !  ; 每流注入
-'pf.mixed'  @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.mixed'  !  ; mixer 输入
-'pf.mixed16' @ 0 'DT' @ 'N'  @ * 2 * cuda.view 'dec.mixed16' ! ; router bf16 像
-'pf.emb'    @ 0 'DT' @ 'N'  @ * 4 * cuda.view 'dec.emb'    !  ; embedding 行
-
-; GDN 层暂存
-'pf.gdn.h'    @ 0 'DT' @ 'C'  @ * 4 * cuda.view 'dec.gdn.h'    !
-'pf.gdn.conv' @ 0 'DT' @ 'C'  @ * 4 * cuda.view 'dec.gdn.conv' !
-'pf.gdn.o'    @ 0 'DT' @ 'ZV' @ * 4 * cuda.view 'dec.gdn.o'    !
-'pf.gdn.z'    @ 0 'DT' @ 'ZV' @ * 4 * cuda.view 'dec.gdn.z'    !
-'pf.gdn.y16'  @ 0 'DT' @ 'ZV' @ * 2 * cuda.view 'dec.gdn.y16'  !
-
-; QSA 层暂存
-'pf.qsa.q'    @ 0 'DT' @ 'QW' @ * 4 * cuda.view 'dec.qsa.q'     !  ; q|gate 连排
-'pf.qsa.kv'   @ 0 'DT' @ 1024 * 4 *    cuda.view 'dec.qsa.kv'   !  ; k、v 各 512 合一块
-'pf.qsa.attn' @ 0 'DT' @ 'ZV' @ * 4 *  cuda.view 'dec.qsa.attn' !
-'pf.qsa.idxk' @ 0 'DT' @ 128 * 4 *     cuda.view 'dec.qsa.idxk' !  ; indexer 原始键
-'pf.qsa.qidx' @ 0 'DT' @ 512 * 4 *     cuda.view 'dec.qsa.qidx' !  ; indexer 查询向量
-'pf.qsa.ids'  @ 0 'DT' @ 'SEL' @ * 4 * cuda.view 'dec.qsa.ids'  !  ; 选中 cell 号
-
-; MoE 暂存
-'pf.moe.logits' @ 0 'DT' @ 'NE' @ * 4 *      cuda.view 'dec.moe.logits' !
-'pf.moe.idsw'   @ 0 'DT' @ 'K' @ * 8 *       cuda.view 'dec.moe.idsw'   !
-'pf.moe.gu'     @ 0 'DT' @ 'K' @ * 1280 * 4 * cuda.view 'dec.moe.gu'     !
-'pf.moe.h'      @ 0 'DT' @ 'K' @ * 640  * 4 * cuda.view 'dec.moe.h'      !
-'pf.moe.out'    @ 0 'DT' @ 'N' @ * 4 *       cuda.view 'dec.moe.out'    !
-'pf.moe.parts'  @ 0 'DT' @ 'K' @ * 'N' @ * 4 * cuda.view 'dec.moe.parts'  !
-'pf.moe.shH'    @ 0 'DT' @ 640 * 4 *         cuda.view 'dec.moe.shH'    !
-'pf.moe.shH16'  @ 0 'DT' @ 640 * 2 *         cuda.view 'dec.moe.shH16'  !
-'pf.moe.shg'    @ 0 'DT' @ 4 *               cuda.view 'dec.moe.shg'    !
 
 ; ============================================================================
 ; Session 常驻状态 —— 单 session、最大 MC=128000，跨 chunk/token 持久

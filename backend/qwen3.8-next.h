@@ -34,11 +34,18 @@
 namespace model {
 
 // ---------------------------------------------------------------------------
+// §0 运行时配置
+// ---------------------------------------------------------------------------
+constexpr int MC = 131072;
+constexpr int CS = 2048;
+
+
+// ---------------------------------------------------------------------------
 // §1 主干(config: text_config)
 // ---------------------------------------------------------------------------
 
-constexpr int VOCAB = 248'320;   // 词表大小(verify:108)
-constexpr int HIDDEN = 2'560;    // 主干隐藏维度(verify:109)
+constexpr int VOCAB = 248320;   // 词表大小(verify:108)
+constexpr int HIDDEN = 2560;    // 主干隐藏维度(verify:109)
 constexpr int N_LAYERS = 48;     // 层数(verify:110)
 constexpr int HC = 4;            // 超连接残差流的条数(config hc_count;verify:111)
 constexpr int HC_DIM = HC * HIDDEN;  // 10240:层间残差流最后一维(verify:160)
