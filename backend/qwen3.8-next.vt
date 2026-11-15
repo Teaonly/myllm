@@ -394,6 +394,7 @@
 ; 残差栈 / 超连接
 'CS' @  'D'  @ * 4 * cuda.alloc 'pf.R'      !  ; 残差栈本体 (CS, hc, N) f32
 'CS' @  'D'  @ * 2 * cuda.alloc 'pf.xn16'   !  ; norm 后各流的 bf16 像（参考契约）
+'CS' @  'HC' @ * 4 * cuda.alloc 'pf.grs'    !  ; norm 行尺度 (CS,HC) f32——gr_mix_r 按同序复算 xn（Strata F-1：省整块 f32 xn）
 'CS' @  'LR' @ * 4 * cuda.alloc 'pf.lo'     !  ; 低秩瓶颈 f32
 'CS' @  'LR' @ * 2 * cuda.alloc 'pf.lo16'   !  ; 低秩瓶颈 bf16 像（参考契约，up 投影吃它）
 'CS' @  'D'  @ * 4 * cuda.alloc 'pf.gated'  !  ; xn·sigmoid(gate)

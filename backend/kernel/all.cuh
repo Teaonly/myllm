@@ -45,6 +45,16 @@ void do_embed(volatile int* inputLeft, volatile int* inputRight,
 // 前的占位，旗写兼任计算链的消耗落点（缘由见 dummy.cu）
 void do_dummy(cudaStream_t stream, volatile int* outputCmd, int outValue);
 
+// 超连接读（kernel/gr.cu）：一个 half（attn/ffn）的残差读，窗口 T 同
+// do_embed。六步 norm→down→silu→up→inject→mix，计算逐字跟随 Strata
+// （契约清单见 gr.cu 头注）。权重是剧本键 blk.%%.hc_{attn,ffn}_*（IQ3_S 包
+// 实测：norm F32、down/up/inject BF16），出进 mixed (T,N) f32+bf16 像
+void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
+                const float* wNorm, const uint16_t* wDown, const uint16_t* wUp, const uint16_t* wInj,
+                const float* R, float* grs, uint16_t* xn16,
+                float* lo, uint16_t* lo16, float* gated, float* inj,
+                float* mixed, uint16_t* mixed16, cudaStream_t stream);
+
 #ifdef __CUDACC__
 // ---------------------------------------------------------------------------
 // 设备侧小入口：kernel 原型 + 跨 .cu 复用的设备函数（仅 nvcc 编译可见）
@@ -85,6 +95,23 @@ __global__ void embed_rows_kernel(const uint8_t* __restrict__ table, size_t row_
 // （Strata src/prefill/kernels.cu:307；那边 N/HC 是编译期常量，这里走形状参数）
 __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R,
                                     int64_t n, int64_t d, int64_t T);
+
+// ---------------------------------------------------------------------------
+// kernel 原型：超连接读主题（实现 kernel/gr.cu）
+// ---------------------------------------------------------------------------
+
+// 逐流 RMSNorm：一行 (t*HC+c) 一块，出行尺度 rs + bf16 像 xn16（不写 f32
+// xn，gr_mix_r_kernel 按同序复算）。Strata kernels.cu:129 的 ldx=D 定版
+__global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
+                                  float* __restrict__ rs_out, uint16_t* __restrict__ xn16);
+
+// lo16 = bf16(silu(lo / HC))——除法在 silu 里面（kernels.cu:269）
+__global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n);
+
+// mixed = Σ_c (R·rs·w)_c · σ(g_c) / HC——均值不是和（kernels.cu:148）
+__global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
+                                const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                int64_t T);
 
 // ---------------------------------------------------------------------------
 // kernel 原型：占位负载主题（实现 kernel/dummy.cu）

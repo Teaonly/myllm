@@ -36,7 +36,7 @@ OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o $(KRNLS) $(DLNK)
 DEPS  := $(OBJS:.o=.d)
 
 $(BIN): $(OBJS)
-	$(CXX) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart -lcudadevrt
+	$(CXX) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcudadevrt
 
 build/%.o: %.cpp
 	@mkdir -p $(dir $@)
