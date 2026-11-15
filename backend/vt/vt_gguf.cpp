@@ -43,9 +43,10 @@ struct GgufLoadWord : vt::NativeWord<CudaTensor> {
         std::string name = stack.pop_string();   // 中层：张量名
         std::string path = stack.pop_string();   // 深层：文件路径（DSL 里先压路径）
 
-        // 读取轨迹（stderr；stdout 是协议通道，禁用）：开始 + 结束各一行
+        // 读取轨迹（stderr；stdout 是协议通道，禁用）：完工后一行，带耗时。
+        // 路径不打：千余张量同一文件，重复百次是噪声；挂死在装载中时少一行
+        // begin 留名，panic 路径将来补名字
         auto t0 = std::chrono::steady_clock::now();
-        std::cerr << "[gguf.load] begin " << path << " :: " << name << std::endl;
 
         // 1. 打开（mmap 整个文件；gguf_open 要求读写权限）
         gguf_ctx* g = gguf_open(path.c_str());
@@ -80,13 +81,10 @@ struct GgufLoadWord : vt::NativeWord<CudaTensor> {
         }
         gguf_close(g);
 
-        // 读取结束：字节数 + 落点 + 耗时（µs；host 到拷完，dev 只到入队不含流排空）
+        // 耗时（µs；host 到拷完，dev 只到入队不含流排空）
         auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0).count();
-        std::cerr << "[gguf.load] end   " << path << " :: " << name
-                  << " " << t.bsize << "B -> "
-                  << (dst->host_ ? "host" : "dev" + std::to_string(ctx_->device()))
-                  << " (" << us << "us)" << std::endl;
+        std::cerr << "[gguf.load] " << name << " (" << us << "us)" << std::endl;
 
         stack.push_tensor(dst);
     }

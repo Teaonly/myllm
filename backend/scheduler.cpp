@@ -12,6 +12,7 @@
 
 #include "scheduler.h"
 #include "kernel/index.h"
+#include "opt/log.h"
 
 namespace myllm {
 
@@ -88,6 +89,7 @@ int Scheduler::run(CudaEnv* env) {
         // 扫描本批消息
         for (Inbound& m : jMessags) {
             if (std::holds_alternative<ExitMsg>(m)) {
+                LOG("Received ExitMsg!");
                 error = 1;
                 break;
             } else if (auto* u = std::get_if<UserMsg>(&m)) {
@@ -142,6 +144,7 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     *staff_.inputLeft = matched;
     *staff_.inputRight = (int)worker_.input_ids.size();
 
+    LOG("Push Device");
 
     // 镜像槽基址 = staff.sessions + SSIZE × target：ids 区在槽首（偏移 0），
     // 新 prompt 先落镜像（H2D 集散地）；[0,matched) 段重写同值，无害
@@ -225,12 +228,8 @@ void Scheduler::beat_device(CudaEnv* env) {
     }
 
     if (state_ == SchedulerState::CHUNKED) {
-        // prefill 全程完工（dummy 未真算 token）。decode kernel 未接，先
-        // 收尾会话：账本按"算到 prompt 末"落账、清台回 IDLE——
-        // TODO decode 接入后这里改转 DECODING 逐拍生成回填
-        cache_.finish( std::move(worker_.input_ids) );
-        worker_ = SessionWorker{};
-        state_ = SchedulerState::IDLE;
+        LOG("CHUNKED IS DONE");
+        state_ = SchedulerState::DECODING;
         return;
     }
 

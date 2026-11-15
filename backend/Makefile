@@ -49,12 +49,11 @@ build/kernel/prefill.o: kernel/prefill.cpp kernel/index.h
 clean:
 	rm -rf build
 
-# host 侧单元测试（无 GPU / 无 CUDA；被测源码直接编入测试目标——库目标待
-# 模块成形再拆）。跑法：make test
-HOLD ?= 45
+FEED_HEAD ?= 30
+FEED_GAP  ?= 0.2
+FEED_TAIL ?= 5
 test_single: $(BIN)
-	( cat test/single.ndjson; sleep $(HOLD); \
-	  printf '{"__type__":"ExitMsg"}\n' ) | $(BIN); \
+	./test/feed.sh test/single.ndjson $(FEED_HEAD) $(FEED_GAP) $(FEED_TAIL) | $(BIN); \
 	st=$$?; case $$st in 1|254) ;; *) exit $$st ;; esac
 
 -include $(DEPS)

@@ -6,8 +6,10 @@
 #include <sstream>
 #include <string>
 
+#include "opt/log.h"
 #include "scheduler.h"
 #include "vt/vt_cuda.hpp"
+
 
 void init(){
     struct sigaction sa;
@@ -23,7 +25,6 @@ int main(int argc, char** argv) {
 
     // 1. global vt stuff
     CudaEnv* env = build_vt_cuda();    // 词表（cuda.* + gguf.* 等）在出厂时装全
-
     // 2. 装载剧本：模型路径写在剧本头部，逐张量 gguf.load → hash（Strata
     //    内存模型：embedding/PLE/MOE 大块不装，名单与层布局见剧本头注释）
     std::ifstream vf("qwen3.8-next.vt");
@@ -34,6 +35,8 @@ int main(int argc, char** argv) {
     std::stringstream ss;
     ss << vf.rdbuf();
     env->execute(ss.str());
+
+    LOG("-------MYLLM IS READY!-------");
 
     // 3. 服务循环：stdin 协议行 → 解析 / 在途记账（单 session）→ stdout
     //    （scheduler.h 头注——计算侧接入后 overlap 五拍挂进 run）
