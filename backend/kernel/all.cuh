@@ -52,12 +52,28 @@ void do_dummy(cudaStream_t stream, volatile int* outputCmd, int outValue);
 // 超连接读（kernel/gr.cu）：一个 half（attn/ffn）的残差读，窗口 T 同
 // do_embed。六步 norm→down→silu→up→inject→mix，计算逐字跟随 Strata
 // （契约清单见 gr.cu 头注）。权重是剧本键 blk.%%.hc_{attn,ffn}_*（IQ3_S 包
-// 实测：norm F32、down/up/inject BF16），出进 mixed (T,N) f32+bf16 像
+// 实测：norm F32、down/up/inject BF16），出进 mixed (T,N) f32 + bf16/f16 两像
+// （bf16 像 = router/α/β 契约，f16 像 = native 投影契约）
 void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
                 const float* wNorm, const uint16_t* wDown, const uint16_t* wUp, const uint16_t* wInj,
                 const float* R, float* grs, uint16_t* xn16,
                 float* lo, uint16_t* lo16, float* gated, float* inj,
-                float* mixed, uint16_t* mixed16, cudaStream_t stream);
+                float* mixed, uint16_t* mixed16, uint16_t* mixedh, cudaStream_t stream);
+
+// GDN 线性注意力层（kernel/gdn.cu，layer 0 专用——层循环接入时参数化）：
+// mixed 两像 → qkv/gate/α/β 四投影 → gates → conv+SiLU+L2 → 递归+输出
+// norm → ssm_out 投影 → bo。state/convHist 是 session view 的 layer 0 基址
+// （'gdn.S'/'gdn.conv'），就地推进跨 chunk 持久。权重类型 layer 0 实测
+// （allocation 表）：qkv Q6_K、gate Q4_K、out Q6_K、α/β BF16、其余 F32，
+// 字节哨兵在 prefill.cpp 组装点
+void do_gdn_layer(volatile int* inputLeft, volatile int* inputRight,
+                  const uint8_t* wQkv, const uint8_t* wGate, const uint8_t* wOut,
+                  const uint16_t* wAlpha, const uint16_t* wBeta,
+                  const float* wConv1d, const float* wNorm, const float* wDtBias, const float* wSsmA,
+                  const uint16_t* mixedh, const uint16_t* mixed16, uint16_t* w16,
+                  float* qkv, float* z, float* ab, float* gate, float* beta,
+                  float* h, float* y, uint16_t* y16, float* bo,
+                  float* state, float* convHist, cudaStream_t stream);
 
 #ifdef __CUDACC__
 // ---------------------------------------------------------------------------
@@ -79,11 +95,27 @@ struct Q6KBlock {
 };
 static_assert(sizeof(Q6KBlock) == 210, "Q6_K block must be 210 bytes");
 
-// dq_q6_k —— 一个超块（ibs 相对行首）→ yy 起 256 个值。32 线程轮两圈覆盖
-// llama.cpp 的 64 个线程角色；每角色写 y[0]/y[32]/y[64]/y[96] 共 4 值。
-// 值 = d * scales[is] * (6bit码 - 32)，码 = ql 低4位 | qh 2bit<<4 ∈ [-32,31]。
-// 实现在 kernel/dq.cu
-__device__ void dq_q6_k(const void* vx, int64_t ibs, float* yy, int tid);
+// Q4_K 超块（llama.cpp block_q4_K，GGML type 12）：每 256 值 144 字节。
+// dm 的两半是 (d, dmin)；值 = (d·sc)·nibble − dmin·m（带减项）
+struct Q4KBlock {
+    __half2 dm;          // (d, dmin) 打包
+    uint8_t scales[12];  // 6bit 尺度/最小值交错（get_scale_min_k4 解）
+    uint8_t qs[128];     // 量化码，每字节低/高 nibble 各一值
+};
+static_assert(sizeof(Q4KBlock) == 144, "Q4_K block must be 144 bytes");
+
+// dq_q6_k / dq_q4_k —— 一个超块（ibs 相对行首）→ yy 起 256 个值。32 线程
+// 轮转覆盖 llama.cpp 的 64 个线程角色。出参模板化（float / __half），
+// 显式实例化在 kernel/dq.cu（跨 .cu 引用走设备链接 -dlink）
+template <typename dst_t>
+__device__ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid);
+template <typename dst_t>
+__device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid);
+
+// 量化权重整块 → f16（kernel/dq.cu）：rows × k 的原始块解进 out（f16，
+// 行距 k）——投影 GEMM 的权重侧前置（Strata native_proj 的 dequant 步）
+void do_dq_q6k_f16(const uint8_t* w, int64_t rows, int64_t k, uint16_t* out, cudaStream_t stream);
+void do_dq_q4k_f16(const uint8_t* w, int64_t rows, int64_t k, uint16_t* out, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // kernel 原型：embedding 主题（实现 kernel/embed.cu）
@@ -112,10 +144,47 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
 // lo16 = bf16(silu(lo / HC))——除法在 silu 里面（kernels.cu:269）
 __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n);
 
-// mixed = Σ_c (R·rs·w)_c · σ(g_c) / HC——均值不是和（kernels.cu:148）
+// mixed = Σ_c (R·rs·w)_c · σ(g_c) / HC——均值不是和（kernels.cu:148）。
+// 出三像：f32 本值 + bf16 像（router/α/β）+ f16 像 mixed_h（native 投影）
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T);
+                                uint16_t* __restrict__ mixed_h, int64_t T);
+
+// ---------------------------------------------------------------------------
+// kernel 原型：GDN 线性注意力主题（实现 kernel/gdn.cu）
+// ---------------------------------------------------------------------------
+
+// gate = softplus(αᵣ+dt_bias)·A、β = σ(βᵣ)（kernels.cu:315）。ab 是 (T,2HV)
+// 的 α|β 合排，A/dt_bias 各 (HV,) F32
+__global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
+                                 const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
+                                 int64_t T);
+
+// 深度 4 因果卷积 + SiLU（kernels.cu:326 串行版 / :344 分块版）与卷积历史
+// 落账（:454）。hist 是 (C,3) 的 pre-conv 输入历史（session 'gdn.conv'）
+__global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restrict__ qkv, const float* __restrict__ w,
+                                float* __restrict__ h, int64_t T);
+__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                      const float* __restrict__ w, float* __restrict__ h, int64_t T);
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T);
+
+// q/k 头逐头 L2 归一（kernels.cu:472；v 通道不归）。eps 加在未缩放平方和上
+// ——与 RMS 的"加在均值上"两套约定，别串
+__global__ void gdn_l2_kernel(float* __restrict__ h, float eps);
+
+// 门控增量网络递归（kernels.cu:595，"same bits" 基线版）：state 布局
+// (S,HV,S) 即 (k 行, v 头, v 列)，y 出 (T,HV·S) 预 norm 值。pipe/kh 是
+// 同位加速变体（kernels.cu:638/801），未搬
+__global__ void __launch_bounds__(32 * 4) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                              const float* __restrict__ gate,
+                                                              const float* __restrict__ beta,
+                                                              float* __restrict__ oc_out, int64_t T);
+
+// 输出侧门控 RMS norm（kernels.cu:2200）：y → y16（f16 像，ssm_out 的 GEMM
+// 入参；f32 归一值不落盘——没有读者）
+__global__ void __launch_bounds__(128) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                           float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
+                                                           int64_t ld16);
 
 // ---------------------------------------------------------------------------
 // kernel 原型：占位负载主题（实现 kernel/dummy.cu）

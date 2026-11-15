@@ -2,8 +2,9 @@
 // prefill.cpp — prefill 两条路径的大入口：纯组装（g++ 编译，不含 kernel）
 // ===========================================================================
 // 一拍 = 窗口内 token 的 embedding（do_embed，真计算）+ 第 0 层 attn 半的
-// 超连接读（do_gr_read，真计算）+ 余下层栈（当前 do_dummy 占位，真 kernel
-// 逐步接入后在此排进组装序列）。组装材料从 env 剧本 hash 与 staff 工作台
+// 超连接读（do_gr_read，真计算）+ 第 0 层 GDN 线性注意力（do_gdn_layer，
+// 真计算）+ 余下层栈（当前 do_dummy 占位，真 kernel 逐步接入后在此排进
+// 组装序列）。组装材料从 env 剧本 hash 与 staff 工作台
 // 现取（见 Mats）；本文件只按序调 all.cuh 的小入口——发射细节（SM 铺满、
 // <<<>>>）都在各小入口的 .cu 里，所以它是 .cpp。
 // ===========================================================================
@@ -45,18 +46,41 @@ struct Mats {
     float* inj;                 // "pf.inj"    (CS, HC) f32
     float* mixed;               // "pf.mixed"  (CS, N)  f32
     uint16_t* mixed16;          // "pf.mixed16" (CS, N) bf16
+    uint16_t* mixedh;           // "pf.mixedh" (CS, N) f16——qkv/gate/out 投影的 GEMM 入参
+    // ---- GDN 层（layer 0；层循环接入后参数化 layer）----
+    const uint8_t* gdnQkv;      // blk.0.attn_qkv.weight    (C,N)   Q6_K
+    const uint8_t* gdnGate;     // blk.0.attn_gate.weight   (ZV,N)  Q4_K
+    const uint8_t* gdnOut;      // blk.0.ssm_out.weight     (N,ZV)  Q6_K
+    const uint16_t* gdnAlpha;   // blk.0.ssm_alpha.weight   (VH,N)  BF16
+    const uint16_t* gdnBeta;    // blk.0.ssm_beta.weight    (VH,N)  BF16
+    const float* gdnConv1d;     // blk.0.ssm_conv1d.weight  (C,4)   F32
+    const float* gdnNorm;       // blk.0.ssm_norm.weight    (S,)    F32
+    const float* gdnDtBias;     // blk.0.ssm_dt.bias        (VH,)   F32
+    const float* gdnSsmA;       // blk.0.ssm_a              (VH,)   F32
+    uint16_t* gdnW16;           // "pf.gdn.w16" (C,N) f16 反量化 scratch
+    float* gdnQkvAct;           // "pf.gdn.qkv" (CS,C) f32
+    float* gdnZ;                // "pf.gdn.z"   (CS,ZV) f32
+    float* gdnAb;               // "pf.gdn.ab"  (CS,2VH) f32
+    float* gdnGateAct;          // "pf.gdn.gate" (CS,VH) f32
+    float* gdnBetaAct;          // "pf.gdn.beta" (CS,VH) f32
+    float* gdnH;                // "pf.gdn.h"   (CS,C) f32
+    float* gdnY;                // "pf.gdn.o"   (CS,ZV) f32（norm 前）
+    uint16_t* gdnY16;           // "pf.gdn.y16" (CS,ZV) f16
+    float* gdnBo;               // "pf.emb" 别名 (T,N)：块输出落在 embedding 缓冲
+    float* gdnState;            // "gdn.S"   layer 0 基址（session view）
+    float* gdnConvHist;         // "gdn.conv" layer 0 基址（session view）
 };
 
-// 尺寸哨兵：hc 权重的字节账（IQ3_S 包 allocation 表：norm F32、其余 BF16，
-// 布局从 Strata ne0/ne1 断言反推）。对不上 = 包变了或键名变了，立刻叫，
-// 别带错账往下算
+// 尺寸哨兵：权重的字节账（IQ3_S 包 allocation 表 + Strata ne0/ne1 断言反推：
+// hc/GDN 各键的类型与形状）。对不上 = 包变了或键名变了，立刻叫，别带错账
+// 往下算
 template <typename T>
-const T* hc_tensor(CudaEnv* env, const char* name, size_t want_bytes) {
+const T* wt_tensor(CudaEnv* env, const char* name, size_t want_bytes) {
     auto t = env->hash().find_tensor(name);
     if (t->size_ != want_bytes) {
         std::fprintf(stderr, "kern: %s is %zu B, expected %zu B (pack layout changed?)\n",
                      name, t->size_, want_bytes);
-        vt_panic("kern: hc weight byte budget mismatch");
+        vt_panic("kern: weight byte budget mismatch");
     }
     return static_cast<const T*>(t->data());
 }
@@ -66,13 +90,34 @@ Mats collect_mats(CudaEnv* env, myllm::SchedulerStaff& staff) {
     constexpr int GR_LAYER = 0;    // 层循环接入前：先只做第 0 层（GDN 层）
     char nb[64];
     std::snprintf(nb, sizeof nb, "blk.%d.hc_attn_norm.weight", GR_LAYER);
-    const float* wn = hc_tensor<float>(env, nb, (size_t) model::HC * model::HIDDEN * 4);
+    const float* wn = wt_tensor<float>(env, nb, (size_t) model::HC * model::HIDDEN * 4);
     std::snprintf(nb, sizeof nb, "blk.%d.hc_attn_down.weight", GR_LAYER);
-    const uint16_t* wd = hc_tensor<uint16_t>(env, nb, (size_t) model::LOWRANK * model::HC_DIM * 2);
+    const uint16_t* wd = wt_tensor<uint16_t>(env, nb, (size_t) model::LOWRANK * model::HC_DIM * 2);
     std::snprintf(nb, sizeof nb, "blk.%d.hc_attn_up.weight", GR_LAYER);
-    const uint16_t* wu = hc_tensor<uint16_t>(env, nb, (size_t) model::HC_DIM * model::LOWRANK * 2);
+    const uint16_t* wu = wt_tensor<uint16_t>(env, nb, (size_t) model::HC_DIM * model::LOWRANK * 2);
     std::snprintf(nb, sizeof nb, "blk.%d.hc_attn_inject.weight", GR_LAYER);
-    const uint16_t* wi = hc_tensor<uint16_t>(env, nb, (size_t) model::HC * model::HC_DIM * 2);
+    const uint16_t* wi = wt_tensor<uint16_t>(env, nb, (size_t) model::HC * model::HC_DIM * 2);
+    // GDN 权重：量化块的行字节数进账（Q6_K 每超块 210 B / Q4_K 144 B，
+    // 每 256 值一块；K 维是行内元素个数，N=2560、ZV=6144 都是 256 的倍数）
+    std::snprintf(nb, sizeof nb, "blk.%d.attn_qkv.weight", GR_LAYER);
+    const uint8_t* wq =
+        wt_tensor<uint8_t>(env, nb, (size_t) model::GDN_CONV_WIDTH * (model::HIDDEN / 256) * 210);
+    std::snprintf(nb, sizeof nb, "blk.%d.attn_gate.weight", GR_LAYER);
+    const uint8_t* wg = wt_tensor<uint8_t>(env, nb, (size_t) model::VALUE_DIM * (model::HIDDEN / 256) * 144);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_out.weight", GR_LAYER);
+    const uint8_t* wo = wt_tensor<uint8_t>(env, nb, (size_t) model::HIDDEN * (model::VALUE_DIM / 256) * 210);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_alpha.weight", GR_LAYER);
+    const uint16_t* wa = wt_tensor<uint16_t>(env, nb, (size_t) model::V_HEADS * model::HIDDEN * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_beta.weight", GR_LAYER);
+    const uint16_t* wb = wt_tensor<uint16_t>(env, nb, (size_t) model::V_HEADS * model::HIDDEN * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_conv1d.weight", GR_LAYER);
+    const float* wc = wt_tensor<float>(env, nb, (size_t) model::GDN_CONV_WIDTH * model::CONV_K * 4);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_norm.weight", GR_LAYER);
+    const float* wnm = wt_tensor<float>(env, nb, (size_t) model::K_DIM * 4);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_dt.bias", GR_LAYER);
+    const float* wdt = wt_tensor<float>(env, nb, (size_t) model::V_HEADS * 4);
+    std::snprintf(nb, sizeof nb, "blk.%d.ssm_a", GR_LAYER);
+    const float* wsa = wt_tensor<float>(env, nb, (size_t) model::V_HEADS * 4);
     return Mats{
         staff.inputLeft, staff.inputRight,
         static_cast<const uint8_t*>(hash.find_tensor("token_embd.weight")->data()),
@@ -89,6 +134,20 @@ Mats collect_mats(CudaEnv* env, myllm::SchedulerStaff& staff) {
         static_cast<float*>(hash.find_tensor("pf.inj")->data()),
         static_cast<float*>(hash.find_tensor("pf.mixed")->data()),
         static_cast<uint16_t*>(hash.find_tensor("pf.mixed16")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.mixedh")->data()),
+        wq, wg, wo, wa, wb, wc, wnm, wdt, wsa,
+        static_cast<uint16_t*>(hash.find_tensor("pf.gdn.w16")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.qkv")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.z")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.ab")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.gate")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.beta")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.h")->data()),
+        static_cast<float*>(hash.find_tensor("pf.gdn.o")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.gdn.y16")->data()),
+        static_cast<float*>(hash.find_tensor("pf.emb")->data()),          // bo 与 emb 别名
+        static_cast<float*>(hash.find_tensor("gdn.S")->data()),           // session view，layer 0 基址
+        static_cast<float*>(hash.find_tensor("gdn.conv")->data()),        // session view，layer 0 基址
     };
 }
 
@@ -98,7 +157,13 @@ void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff) {
     const Mats m = collect_mats(env, staff);
     do_embed(m.inputLeft, m.inputRight, m.table, m.tokens, m.emb, m.res, m.stream);
     do_gr_read(m.inputLeft, m.inputRight, m.hcNorm, m.hcDown, m.hcUp, m.hcInj,
-               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.stream);
+               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.mixedh, m.stream);
+    do_gdn_layer(m.inputLeft, m.inputRight,
+                 m.gdnQkv, m.gdnGate, m.gdnOut, m.gdnAlpha, m.gdnBeta,
+                 m.gdnConv1d, m.gdnNorm, m.gdnDtBias, m.gdnSsmA,
+                 m.mixedh, m.mixed16, m.gdnW16,
+                 m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
+                 m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
     do_dummy(m.stream, m.outputCmd, 1);    // 占位层栈（分诊值：chunking=1）
 }
 
@@ -106,7 +171,13 @@ void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
     const Mats m = collect_mats(env, staff);
     do_embed(m.inputLeft, m.inputRight, m.table, m.tokens, m.emb, m.res, m.stream);
     do_gr_read(m.inputLeft, m.inputRight, m.hcNorm, m.hcDown, m.hcUp, m.hcInj,
-               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.stream);
+               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.mixedh, m.stream);
+    do_gdn_layer(m.inputLeft, m.inputRight,
+                 m.gdnQkv, m.gdnGate, m.gdnOut, m.gdnAlpha, m.gdnBeta,
+                 m.gdnConv1d, m.gdnNorm, m.gdnDtBias, m.gdnSsmA,
+                 m.mixedh, m.mixed16, m.gdnW16,
+                 m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
+                 m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
     do_dummy(m.stream, m.outputCmd, 2);    // 占位层栈（分诊值：chunked=2）
 }
 

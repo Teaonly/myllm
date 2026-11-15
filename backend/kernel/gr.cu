@@ -65,6 +65,9 @@ __device__ __forceinline__ uint16_t bf(float f) {
     return (uint16_t) (u >> 16);
 }
 
+// f32 → f16，RNE 舍入（kernels.cu:46 hf）——native 投影的 f16 像契约
+__device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__float2half_rn(f)); }
+
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -157,10 +160,11 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
 }
 
 // mixed = Σ_c (R·rs·w)_c · σ(gate_c) / HC（kernels.cu:148；xn 按同序复算，
-// 与 gr_norm_rs 的值逐位一致——F-1 的前提）
+// 与 gr_norm_rs 的值逐位一致——F-1 的前提）。出三像：f32 本值 + bf16 像
+// （router/α/β 契约）+ f16 像 mixed_h（native 投影契约，hf RNE）
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T) {
+                                uint16_t* __restrict__ mixed_h, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -174,6 +178,7 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
     s /= (float) HC;
     mixed[i] = s;
     mixed16[i] = bf(s);
+    mixed_h[i] = hf(s);
 }
 
 // ---- 发射器：一个 half 的完整读，六步按序 ----
@@ -188,7 +193,7 @@ void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
                 float* lo, uint16_t* lo16,   // (T,LR)
                 float* gated,           // (T,D)   f32
                 float* inj,             // (T,HC)  f32
-                float* mixed, uint16_t* mixed16,  // (T,N) f32 + bf16 像
+                float* mixed, uint16_t* mixed16, uint16_t* mixedh,  // (T,N) f32 + bf16/f16 两像
                 cudaStream_t stream) {
     const int cs = model::CS;
     const int left = *inputLeft, right = *inputRight;
@@ -212,8 +217,8 @@ void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
     // 5. inject：xn16 (T,D) × wi (HC,D)ᵀ → inj (T,HC)
     gemm_bf16(xn16, wInj, inj, T, HC, D, stream);
 
-    // 6. mix：均值出 mixed（f32 + bf16 像，像喂后续 router 契约）
-    gr_mix_r_kernel<<<blocks_for((int64_t) T * N), 256, 0, stream>>>(R, grs, wNorm, gated, mixed, mixed16, T);
+    // 6. mix：均值出 mixed（f32 + bf16/f16 两像：bf16 喂 router/α/β，f16 喂 native 投影）
+    gr_mix_r_kernel<<<blocks_for((int64_t) T * N), 256, 0, stream>>>(R, grs, wNorm, gated, mixed, mixed16, mixedh, T);
     check_launch("gr_mix_r");
 }
 

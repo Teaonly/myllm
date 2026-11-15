@@ -386,7 +386,7 @@
 ; Prefill 激活缓冲 —— 全部随 CS 线性伸缩（字节 = 宽度 × CS × 元素大小）
 ; ============================================================================
 
-; ---- 每token账：残差 129K + GDN 143K + QSA 90K + MoE 196K ≈ 558 KB ----
+; ---- 每token账：残差 134K + GDN 143K + QSA 90K + MoE 196K ≈ 563 KB ----
 ; ---- （MoE 含 parts T×K×N=100K/token，初版账漏了它）----
 ; ---- CS=2048 时合计约 1.1 GiB；稳定后可把 GDN/QSA/MoE 三组暂存 ----
 ; ---- 合并成 max() 一块轮用，省约一半 ----
@@ -400,15 +400,20 @@
 'CS' @  'D'  @ * 4 * cuda.alloc 'pf.gated'  !  ; xn·sigmoid(gate)
 'CS' @  'HC' @ * 4 * cuda.alloc 'pf.inj'    !  ; 每流注入（两半段先后复用）
 'CS' @  'N'  @ * 4 * cuda.alloc 'pf.mixed'  !  ; 均值后的 mixer 输入
-'CS' @  'N'  @ * 2 * cuda.alloc 'pf.mixed16' ! ; router 契约 / f16 GEMM 的 bf16 像（纯 f32 GEMM 可省）
+'CS' @  'N'  @ * 2 * cuda.alloc 'pf.mixed16' ! ; router 契约 / bf16 GEMM（α/β 投影）的 bf16 像
+'CS' @  'N'  @ * 2 * cuda.alloc 'pf.mixedh' ! ; f16 GEMM（qkv/gate/out 投影）的 f16 像
 'CS' @  'N'  @ * 4 * cuda.alloc 'pf.emb'    !  ; 本块 embedding（块输出 bo 与之别名）
 
 ; GDN 层暂存
-'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.h'     !  ; conv→SiLU 后的 q|k|v
-'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.conv'  !  ; conv1d 输出（h 的前身）
-'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.o'     !  ; 递归步输出
-'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.z'     !  ; 输出门 z
-'CS' @  'ZV' @ * 2 * cuda.alloc 'pf.gdn.y16'   !  ; norm 后 y 的 bf16 像
+'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.qkv'   !  ; qkv 投影出 = conv 入参
+'CS' @  'C'  @ * 4 * cuda.alloc 'pf.gdn.h'     !  ; conv→SiLU→L2 后的 q|k|v
+'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.z'     !  ; gate 投影出（输出门）
+'CS' @  'VH' @ 2 * * 4 * cuda.alloc 'pf.gdn.ab'   !  ; α|β 合排 (CS,2·VH)，ldy=2VH 交错写
+'CS' @  'VH' @ * 4 * cuda.alloc 'pf.gdn.gate' !  ; 递归门 (CS,VH)
+'CS' @  'VH' @ * 4 * cuda.alloc 'pf.gdn.beta' !  ; 递归 β (CS,VH)
+'CS' @  'ZV' @ * 4 * cuda.alloc 'pf.gdn.o'     !  ; 递归输出（norm 前 y）
+'CS' @  'ZV' @ * 2 * cuda.alloc 'pf.gdn.y16'   !  ; norm 后 y 的 f16 像（out 投影入参）
+'C'  @  'N'  @ * 2 * cuda.alloc 'pf.gdn.w16'   !  ; 量化权重反量化 f16 scratch（固定 50 MiB，不随 CS；qkv/gate/out 同流先后复用）
 
 ; QSA 层暂存
 'CS' @  'QW' @ * 4 * cuda.alloc 'pf.qsa.q'     !  ; q|gate 连排
