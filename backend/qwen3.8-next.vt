@@ -460,6 +460,18 @@
     'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * cuda.view 'cache.V' !    ; (QL, MC, KW) V 池
 'offset' @ 'QL' @ 'MC' @ * 'KW' @ * 'KVE' @ * + 'offset' !   ; 后续 GDN/QSA 状态接着排
 
+; ---- GDN 递归状态（36 层，FP32 契约）——S 矩阵与 conv 历史分列两块 ----
+; gdn.S    每层 786'432 f32（VH×128×128，每 v-head 一张 K×V 状态矩阵）
+; gdn.conv 每层 3×10240 f32：卷积前 qkv 输入的最近 3 行 
+
+"session.cuda" @ 'offset' @
+    'VH' @ 'S' @ * 'S' @ * 'GL' @ * 4 * cuda.view 'gdn.S' !
+'offset' @ 'VH' @ 'S' @ * 'S' @ * 'GL' @ * 4 * + 'offset' !   ; +108 MiB
+
+"session.cuda" @ 'offset' @
+    'C' @ 3 * 'GL' @ * 4 * cuda.view 'gdn.conv' !
+'offset' @ 'C' @ 3 * 'GL' @ * 4 * + 'offset' !                ; +4.2 MiB；session.cuda 还剩 ~0.96 GiB 给 rope 表/PLE
+
 'offset' !!                                                  ; 临时量出hash：后续状态接着排时再立
 
 ; 主机端配置多分Session内存，届时一次 H2D 复制完成

@@ -13,6 +13,7 @@
 #include "vt/vt.hpp"    // vt_panic
 
 #include <cstdio>
+#include <cstring>
 
 namespace kern {
 
@@ -109,8 +110,27 @@ void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
     do_dummy(m.stream, m.outputCmd, 2);    // 占位层栈（分诊值：chunked=2）
 }
 
+// session reset（新对话未命中任何前缀时，scheduler 在整块 H2D 之前调）：
+// 只清 host 镜像——它是权威侧，之后整块 H2D 自然把零带上设备（Strata
+// session_zero 同语义；反过来只 memset device 会被镜像 H2D 覆盖）。布局
+// 知识一个字节不进 C++：要清的状态就是这张剧本名字表（K/V/ids 不在表上，
+// 不动），块内偏移现场问张量本人（data() − 真身基址）。find 缺席即崩：
+// 剧本没切这块/名字漂了 = bug，当场叫（Hash 崩前已把名字打上 stderr）。
 void reset_session(CudaEnv* env, myllm::SchedulerStaff& staff, int target) {
-    // TODO ，清零相关矩阵
+    auto& hash = env->hash();
+    auto  root = hash.find_tensor("session.cuda");    // 真身：基址 + 槽跨距(SSIZE)
+    vt_assert(target >= 0 && target < (int)hash.find_number("SS"),
+              "reset_session: target out of session slots");
+    for (const char* name : {"gdn.S", "gdn.conv"}) {
+        auto v = hash.find_tensor(name);
+        // 哨兵：状态必须是 session.cuda 上切出的 view（owner_ 已扁平化到
+        // 真身）——名字指到别的块 = 剧本与名字表失配，别把零 memset 出界
+        vt_assert(v->view_ && v->owner_.get() == root.get(),
+                  "reset_session: state must be a view carved from session.cuda");
+        const size_t off = static_cast<char*>(v->data()) - static_cast<char*>(root->data());
+        memset(static_cast<char*>(staff.allSessions) + (size_t)target * root->size_ + off,
+               0, v->size_);
+    }
 }
 
 }  // namespace kern

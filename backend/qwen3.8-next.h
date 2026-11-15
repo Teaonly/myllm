@@ -202,8 +202,14 @@ constexpr bool MTP_DEDICATED_EMBED = false;  // 与主干共享 embed/lm_head(co
 
 // GDN 递归状态 S:每层一个 (V_HEADS, V_DIM, K_DIM) = 48×128×128 的 FP32 矩阵组。
 constexpr int GDN_S_ELEMS = V_HEADS * V_DIM * K_DIM;          // 786'432
-// GDN conv 状态:最近 CONV_K=4 个输入(含当前槽),通道宽 GDN_CONV_WIDTH。
-constexpr int GDN_CONV_STATE_ELEMS = GDN_CONV_WIDTH * CONV_K; // 40'960
+// GDN conv 历史:卷积前 qkv 输入的最近 CONV_K-1=3 行(当前行在激活缓冲,不占
+// 状态),f32。原 §10 的 bf16×4 槽(含当前槽)方案作废:语义取 Strata 的
+// ssm_conv_channels × (ssm_d_conv - 1)(session.cpp:38)。
+constexpr int GDN_CONV_STATE_ELEMS = GDN_CONV_WIDTH * (CONV_K - 1);  // 30'720
+// 布局(引擎自定,可维护性优先):S 与 conv 各自整块连排,层距即元素数,vt 侧
+// 'gdn.S'/'gdn.conv' 两个 view。Strata 则每层连排一块 [S|conv](gdn_state_floats
+// 层距 817'152,conv 在层内偏移 786'432 处)——纯组织方式之差,数值语义一致;
+// 与 Strata 的 dump 对拍时按其层内偏移切两段取数。
 // 全注意力 KV:每 token 每层 K+V 各 (N_KV_HEADS, HEAD_DIM)。
 constexpr int KV_ELEMS_PER_TOKEN_LAYER = N_KV_HEADS * HEAD_DIM * 2;  // 1'024
 // PLE 膨胀卷积状态(仅第 1 层):PLE_CONV_STATE_LEN 个槽 × HC_DIM 通道。
@@ -211,7 +217,7 @@ constexpr int PLE_CONV_STATE_ELEMS = PLE_CONV_STATE_LEN * HC_DIM;    // 92'160
 
 // 固定开销速查(单路序列,不含权重):
 //   GDN S 状态     786'432 × 4B × 36 层            = 108 MiB(FP32,数值契约)
-//   GDN conv 状态  40'960 × 2B × 36 层             ≈ 2.8 MiB(bf16)
+//   GDN conv 状态  30'720 × 4B × 36 层             ≈ 4.2 MiB(FP32,Strata 同型)
 //   PLE conv 状态  92'160 × 2B × 1 层              ≈ 180 KiB(bf16)
 //   KV cache       1'024 × 2B × 12 层 = 24 KiB/token;满 262'144 上下文 ≈ 6 GiB
 // 双流合计:递归状态 ~216 MiB + 各自 KV。对 A100 64G 而言都很便宜,真正的
@@ -334,7 +340,7 @@ static_assert(PLE_HEAD_DIM * NGRAM_HEADS == PLE_EMBED, "PLE: 16 头 × 160 = 256
 static_assert(sizeof(HEAD_SIZES) / sizeof(HEAD_SIZES[0]) == NGRAM_HEADS, "16 个素数头");
 static_assert(sizeof(HEAD_OFFSETS) / sizeof(HEAD_OFFSETS[0]) == NGRAM_HEADS, "16 个累计偏移");
 static_assert(sizeof(LAYER_MULT) / sizeof(LAYER_MULT[0]) == NGRAM_SIZE, "3 个位置乘数");
-static_assert(GDN_S_ELEMS == 786'432 && GDN_CONV_STATE_ELEMS == 40'960, "GDN 状态几何");
+static_assert(GDN_S_ELEMS == 786'432 && GDN_CONV_STATE_ELEMS == 30'720, "GDN 状态几何");
 static_assert(KV_ELEMS_PER_TOKEN_LAYER == 1'024, "每 token 每层 KV 元素数");
 static_assert(PLE_CONV_STATE_ELEMS == 92'160, "PLE 卷积状态 = 9 × 10240");
 
