@@ -121,6 +121,16 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
 // 与旗写缘由见 dummy.cu）
 __global__ void dummy_kernel(int iters, volatile int* outputCmd, int outValue);
 
+// 辅助函数
+void check_launch(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "kern: %s launch failed: %s\n", what, cudaGetErrorString(e));
+        vt_panic("kern: gr kernel launch failed");
+    }
+}
+
+
 #endif  // __CUDACC__
 
 }  // namespace kern

@@ -90,16 +90,6 @@ __device__ float block_sum(float v, float* sh) {
     return sh[0];
 }
 
-// ---- host 件 ----
-
-void check_launch(const char* what) {
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "kern: %s launch failed: %s\n", what, cudaGetErrorString(e));
-        vt_panic("kern: gr kernel launch failed");
-    }
-}
-
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
 // cuBLAS handle：懒建、常驻（绑建当时的当前设备——与 execStream 同设备，
@@ -135,32 +125,6 @@ void gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                                           &beta, Y, CUDA_R_32F, (int) Nn,
                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s != CUBLAS_STATUS_SUCCESS) vt_panic("kern: gr cublasGemmEx failed");
-}
-
-// 落盘（MYLLM_GR_DUMP=<前缀>）：一块裸二进制 <前缀>.<tag>；meta 只写首拍
-void dump_rows(const char* tag, const void* dev, size_t bytes, int T, cudaStream_t st) {
-    const char* pref = std::getenv("MYLLM_GR_DUMP");
-    if (pref == nullptr || pref[0] == '\0') return;
-    std::vector<uint8_t> host(bytes);
-    if (cudaMemcpy(host.data(), dev, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        cudaGetLastError();
-        vt_panic("kern: gr dump memcpy failed");
-    }
-    std::string name = std::string(pref) + "." + tag;
-    std::FILE* fp = std::fopen(name.c_str(), "wb");
-    if (fp == nullptr) vt_panic("kern: gr dump fopen failed");
-    std::fwrite(host.data(), 1, bytes, fp);
-    std::fclose(fp);
-    static bool meta = false;   // 调试钩子，一次性状态可接受
-    if (!meta) {
-        meta = true;
-        std::FILE* mf = std::fopen((std::string(pref) + ".meta").c_str(), "w");
-        if (mf != nullptr) {
-            std::fprintf(mf, "T %d N %d HC %d D %d LR %d\n", T, N, HC, D, LR);
-            std::fclose(mf);
-        }
-    }
-    (void) st;   // 同步 memcpy，流序天然已含前序 kernel
 }
 
 }  // namespace
@@ -236,31 +200,23 @@ void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
     // 1. 逐流 norm → grs + xn16（grid = T*HC 行，块 256——Strata 发射同款）
     gr_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, stream>>>(R, wNorm, model::RMS_EPS, grs, xn16);
     check_launch("gr_norm_rs");
-    dump_rows("grs", grs, (size_t) T * HC * 4, T, stream);
-    dump_rows("xn16", xn16, (size_t) T * D * 2, T, stream);
 
     // 2. down：xn16 (T,D) × wd (LR,D)ᵀ → lo (T,LR)
     gemm_bf16(xn16, wDown, lo, T, LR, D, stream);
-    dump_rows("lo", lo, (size_t) T * LR * 4, T, stream);
 
     // 3. silu：lo → lo16（/HC 在里面）
     gr_silu_kernel<<<blocks_for((int64_t) T * LR), 256, 0, stream>>>(lo, lo16, (int64_t) T * LR);
     check_launch("gr_silu");
-    dump_rows("lo16", lo16, (size_t) T * LR * 2, T, stream);
 
     // 4. up：lo16 (T,LR) × wu (D,LR)ᵀ → gated (T,D)
     gemm_bf16(lo16, wUp, gated, T, D, LR, stream);
-    dump_rows("gated", gated, (size_t) T * D * 4, T, stream);
 
     // 5. inject：xn16 (T,D) × wi (HC,D)ᵀ → inj (T,HC)
     gemm_bf16(xn16, wInj, inj, T, HC, D, stream);
-    dump_rows("inj", inj, (size_t) T * HC * 4, T, stream);
 
     // 6. mix：均值出 mixed（f32 + bf16 像，像喂后续 router 契约）
     gr_mix_r_kernel<<<blocks_for((int64_t) T * N), 256, 0, stream>>>(R, grs, wNorm, gated, mixed, mixed16, T);
     check_launch("gr_mix_r");
-    dump_rows("mixed", mixed, (size_t) T * N * 4, T, stream);
-    dump_rows("mixed16", mixed16, (size_t) T * N * 2, T, stream);
 }
 
 }  // namespace kern
