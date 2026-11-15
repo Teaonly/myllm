@@ -65,6 +65,33 @@ Mats collect_mats(CudaEnv* env, myllm::SchedulerStaff& staff) {
     const float* wdt = wt_tensor<float>(env, nb, (size_t) model::V_HEADS * 4);
     std::snprintf(nb, sizeof nb, "blk.%d.ssm_a", GR_LAYER);
     const float* wsa = wt_tensor<float>(env, nb, (size_t) model::V_HEADS * 4);
+    // ffn 半超连接：形状与 attn 半同款（HC,N)/(LR,D)/(D,LR)/(HC,D)，BF16/F32
+    std::snprintf(nb, sizeof nb, "blk.%d.hc_ffn_norm.weight", GR_LAYER);
+    const float* fwn = wt_tensor<float>(env, nb, (size_t) model::HC * model::HIDDEN * 4);
+    std::snprintf(nb, sizeof nb, "blk.%d.hc_ffn_down.weight", GR_LAYER);
+    const uint16_t* fwd = wt_tensor<uint16_t>(env, nb, (size_t) model::LOWRANK * model::HC_DIM * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.hc_ffn_up.weight", GR_LAYER);
+    const uint16_t* fwu = wt_tensor<uint16_t>(env, nb, (size_t) model::HC_DIM * model::LOWRANK * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.hc_ffn_inject.weight", GR_LAYER);
+    const uint16_t* fwi = wt_tensor<uint16_t>(env, nb, (size_t) model::HC * model::HC_DIM * 2);
+    // MoE 权重（层 0 类型实测；行字节按块几何：IQ3_XXS 98 B/256 值、
+    // IQ4_NL 18 B/32 值、Q4_K 144 B/256、IQ4_XS 136 B/256）
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_gate_inp.weight", GR_LAYER);
+    const uint16_t* mr = wt_tensor<uint16_t>(env, nb, (size_t) model::N_EXPERTS * model::HIDDEN * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_gate_inp_shexp.weight", GR_LAYER);
+    const uint16_t* msg = wt_tensor<uint16_t>(env, nb, (size_t) model::HIDDEN * 2);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_gate_exps.weight", GR_LAYER);
+    const uint8_t* meg = wt_tensor<uint8_t>(env, nb, (size_t) model::N_EXPERTS * model::MOE_INT * (model::HIDDEN / 256) * 98);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_up_exps.weight", GR_LAYER);
+    const uint8_t* meu = wt_tensor<uint8_t>(env, nb, (size_t) model::N_EXPERTS * model::MOE_INT * (model::HIDDEN / 256) * 98);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_down_exps.weight", GR_LAYER);
+    const uint8_t* med = wt_tensor<uint8_t>(env, nb, (size_t) model::N_EXPERTS * model::HIDDEN * (model::MOE_INT / 32) * 18);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_gate_shexp.weight", GR_LAYER);
+    const uint8_t* msgate = wt_tensor<uint8_t>(env, nb, (size_t) model::MOE_INT * (model::HIDDEN / 256) * 144);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_up_shexp.weight", GR_LAYER);
+    const uint8_t* msup = wt_tensor<uint8_t>(env, nb, (size_t) model::MOE_INT * (model::HIDDEN / 256) * 136);
+    std::snprintf(nb, sizeof nb, "blk.%d.ffn_down_shexp.weight", GR_LAYER);
+    const uint8_t* msdown = wt_tensor<uint8_t>(env, nb, (size_t) model::HIDDEN * (model::MOE_INT / 32) * 18);
     return Mats{
         staff.inputLeft, staff.inputRight,
         static_cast<const uint8_t*>(hash.find_tensor("token_embd.weight")->data()),
@@ -95,6 +122,24 @@ Mats collect_mats(CudaEnv* env, myllm::SchedulerStaff& staff) {
         static_cast<float*>(hash.find_tensor("pf.emb")->data()),          // bo 与 emb 别名
         static_cast<float*>(hash.find_tensor("gdn.S")->data()),           // session view，layer 0 基址
         static_cast<float*>(hash.find_tensor("gdn.conv")->data()),        // session view，layer 0 基址
+        fwn, fwd, fwu, fwi,
+        mr, msg, meg, meu, med, msgate, msup, msdown,
+        static_cast<float*>(hash.find_tensor("pf.moe.logits")->data()),
+        static_cast<int32_t*>(hash.find_tensor("pf.moe.ids")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.w")->data()),
+        static_cast<int32_t*>(hash.find_tensor("pf.moe.slot")->data()),
+        static_cast<int32_t*>(hash.find_tensor("pf.moe.src")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.moe.xs")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.gu")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.moe.h")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.parts")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.moe.dqgu")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.moe.dqd")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.sgate")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.sup")->data()),
+        static_cast<uint16_t*>(hash.find_tensor("pf.moe.shH16")->data()),
+        static_cast<float*>(hash.find_tensor("pf.moe.out")->data()),      // shared=bo 原地
+        static_cast<float*>(hash.find_tensor("pf.moe.shg")->data()),
     };
 }
 

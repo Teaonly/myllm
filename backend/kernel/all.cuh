@@ -81,6 +81,34 @@ void do_gdn_layer(volatile int* inputLeft, volatile int* inputRight,
                   float* h, float* y, uint16_t* y16, float* bo,
                   float* state, float* convHist, cudaStream_t stream);
 
+// MoE 块（kernel/moe.cu，layer 0 专用——层循环接入后按 48 层类型表参数化）：
+// 路由 → host 分组 → 收行 → 共享专家 + 逐专家 dq/GEMM → combine 原地出 bo。
+// 层 0 类型实测：路由/标量门 BF16、专家 gate/up IQ3_XXS、down IQ4_NL、共享
+// gate Q4_K、up IQ4_XS、down IQ4_NL（契约清单见 moe.cu 头注）
+void do_moe_layer(volatile int* inputLeft, volatile int* inputRight,
+                  const uint16_t* wRouter, const uint16_t* wShGate,
+                  const uint8_t* expGate, const uint8_t* expUp, const uint8_t* expDown,
+                  const uint8_t* shGate, const uint8_t* shUp, const uint8_t* shDown,
+                  const uint16_t* mixed16, const uint16_t* mixedh,
+                  float* logits, int32_t* ids, float* w, int32_t* slot, int32_t* src,
+                  uint16_t* xs, float* gu, uint16_t* hh, float* dm,
+                  uint16_t* dqGu, uint16_t* dqD,
+                  float* sgate, float* sup, uint16_t* shh, float* shared, float* sg, float* bo,
+                  cudaStream_t stream);
+
+// IQ4_NL / IQ4_XS 整块 → f16（kernel/moe.cu）：n 个连续值（256 的倍数）解进
+// out。共享专家反量化用；类型具体化不走分派
+void do_dq_iq4nl_flat_f16(const uint8_t* w, int64_t n, uint16_t* out, cudaStream_t stream);
+void do_dq_iq4xs_flat_f16(const uint8_t* w, int64_t n, uint16_t* out, cudaStream_t stream);
+
+// cublas f16/bf16 GEMM（kernel/gdn.cu）：Y (T,Nn) f32 = X (T,K) × W (Nn,K)ᵀ，
+// f16/bf16 行主序入、f32 出、COMPUTE_32F（Strata gemm.cu:1164 默认形态）。
+// ldy 显式给（Y 行距）；GdnBlas 句柄懒建常驻
+void gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t Nn, int64_t K, int64_t ldy,
+              cudaStream_t st);
+void gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t Nn, int64_t K, int64_t ldy,
+               cudaStream_t st);
+
 #ifdef __CUDACC__
 // ---------------------------------------------------------------------------
 // 设备侧小入口：kernel 原型 + 跨 .cu 复用的设备函数（仅 nvcc 编译可见）
@@ -109,6 +137,36 @@ struct Q4KBlock {
     uint8_t qs[128];     // 量化码，每字节低/高 nibble 各一值
 };
 static_assert(sizeof(Q4KBlock) == 144, "Q4_K block must be 144 bytes");
+
+// IQ3_XXS 超块（ggml-common.h:406 block_iq3_xxs，GGML type 18）：每 256 值
+// 98 字节 = d + qs[96]；qs 前 64 字节是 8 子块 × 8 码（查 iq3xxs_grid），
+// 尾 32 字节是 8 个子块的 uint16 尺度对（dq 里按 (uint16*)(qs+64) 取）
+struct IQ3XXSBlock {
+    __half d;
+    uint8_t qs[3 * 256 / 8];
+};
+static_assert(sizeof(IQ3XXSBlock) == 98, "IQ3_XXS block must be 98 bytes");
+
+// IQ4_NL 小块（ggml-common.h:447 block_iq4_nl，GGML type 20）：每 32 值
+// 18 字节 = d + 16 字节 nibble 码（查 kvalues_iq4nl 非线性码本）——不是
+// 256 超块族；256 值 = 8 个这种小块连排
+struct IQ4NLBlock {
+    __half d;
+    uint8_t qs[16];
+};
+static_assert(sizeof(IQ4NLBlock) == 18, "IQ4_NL block must be 18 bytes");
+
+// IQ4_XS 超块（ggml-common.h:453 block_iq4_xs，GGML type 23）：每 256 值
+// 136 字节；尺度 6bit 拆 scales_h(uint16, 8×2bit)/scales_l(4bit)，值查
+// kvalues_iq4nl。注意 scales_h 是裸 uint16 不是 half——那 16 位是 8 个 2bit
+// 尺度高段，按位取不按浮点解
+struct IQ4XSBlock {
+    __half d;
+    uint16_t scales_h;
+    uint8_t scales_l[256 / 64];
+    uint8_t qs[256 / 2];
+};
+static_assert(sizeof(IQ4XSBlock) == 136, "IQ4_XS block must be 136 bytes");
 
 // dq_q6_k / dq_q4_k —— 一个超块（ibs 相对行首）→ yy 起 256 个值。32 线程
 // 轮转覆盖 llama.cpp 的 64 个线程角色。出参模板化（float / __half），
@@ -209,6 +267,9 @@ __global__ void dummy_kernel(int iters, volatile int* outputCmd, int outValue);
 // host 辅助：launch 检查（各主题发射器共用；inline 就地——本头进多个
 // nvcc 编译单元，非 inline 定义会撞链接）
 // ---------------------------------------------------------------------------
+
+// 网格尺寸取整：ceil(n/t)，发射器算 gridDim.x 用（gr.cu 首创后各主题共用）
+inline unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 
 // 发射后查 cudaGetLastError：失败打 what 与详情、panic fail fast。
 // 具体 kernel 名看 stderr 首行，panic 文案保持通用

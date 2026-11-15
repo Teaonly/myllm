@@ -69,8 +69,6 @@ __device__ __forceinline__ float warp_sum(float v) {
 // f32 → f16，RNE 舍入（kernels.cu:46 hf）——y16 契约
 __device__ __forceinline__ uint16_t hf(float f) { return __half_as_ushort(__float2half_rn(f)); }
 
-unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
-
 // cuBLAS handle：懒建、常驻（契约同 gr.cu 的 GrBlas——32 MiB workspace +
 // DEFAULT_MATH，Strata GEMM_WS 同配置；每主题一份，同形调用同一算法）
 struct GdnBlas {
@@ -91,6 +89,10 @@ struct GdnBlas {
         if (ws) cudaFree(ws);
     }
 };
+
+}  // namespace
+
+// ---- 跨主题 GEMM 小入口（kern 域，声明在 all.cuh；gdn 首创，moe 复用）----
 
 // Y (T,Nn) f32 行主序 = X (T,K) f16 行主序 × W (Nn,K) f16 行主序的转置，
 // 行距 ldy（gemm.cu:1164 默认形态：OP_T OP_N, f16×f16→f32, COMPUTE_32F,
@@ -121,8 +123,6 @@ void gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (s != CUBLAS_STATUS_SUCCESS) vt_panic("kern: gdn cublasGemmEx bf16 failed");
 }
-
-}  // namespace
 
 // ---- kernels：Strata 原文的裁直版（丢 *_lo 仪表与未启用的分叉）----
 

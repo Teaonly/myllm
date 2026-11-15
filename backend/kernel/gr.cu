@@ -97,8 +97,6 @@ __device__ float block_sum(float v, float* sh) {
     return sh[0];
 }
 
-unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
-
 // cuBLAS handle：懒建、常驻（绑建当时的当前设备——与 execStream 同设备，
 // scheduler 不会中途换卡）。32 MiB workspace + DEFAULT_MATH 同 Strata。
 struct GrBlas {

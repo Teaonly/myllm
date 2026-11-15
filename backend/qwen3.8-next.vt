@@ -4,9 +4,10 @@
 ; main 直接加载本剧本，装完进入 command loop 逐行执行 vt 指令（REPL）。
 ;
 ; 内存模型参照 Strata run-iq3_s.sh：小权重（attention/ssm/超连接/共享专家/
-; 路由/output_hc）全数常驻显存；大块不装，留给后续按需路径——
+; 路由/output_hc）全数常驻显存；MOE 路由专家显存已占位、暂不装载（装载
+; 策略随 MoE kernel 接入再定）；剩大块不碰——
 ;     per_layer_token_embd.weight         PLE 巨表 28.8GB（在 00002 分片）
-;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3）
+;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3，≈46.8 GiB）
 ; 词表矩阵（token_embd/output）模型层 weight-tied；pack 里是同源两种量化
 ; （output=Q6_K 497MiB，token_embd=IQ4_XS 322MiB），装高精度 Q6_K 一份、
 ; 两个名字共用（embedding 侧吃到更高精度的同一矩阵，省 322MiB）。
@@ -19,9 +20,10 @@
 ;   cuda.alloc      ( n -- tensor )         显存块（host.alloc 则落主机锁页）
 ;   gguf.load       ( path name dst -- dst ) 装入（dev 异步 H2D / host 直拷）
 ;   swap !          ( tensor name -- ) 存进 hash；path 留栈
-; 装完 drop 掉路径。合计 1078 个 =
+; 装完 drop 掉路径。合计 1078 个装载 =
 ;   3 顶层 output_hc + 1 词表矩阵(双名字一份显存) + 6 PLE 投影(blk.1)
 ;   + 48 层 × 13 公共 + 36 GDN 层 × 9 + 12 全注意力层 × 10
+; 另有 48 层 × 3 = 144 个专家块只 probe+alloc 占位（见下），不装载
 ; ============================================================================
 
 ; ---- 模型路径（文件头直接设定；dup 一份进 hash 留档，REPL 里 'model.gguf' @ 随取）----
@@ -51,6 +53,23 @@
 'blk.%%.hc_ffn_inject.weight'      dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 'blk.%%.hc_ffn_norm.weight'        dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 'blk.%%.hc_ffn_up.weight'          dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
+%endf
+
+; ---- MoE 路由专家（48 层 × 3）：显存占位、不装载 ----
+; GSQ-RCO 包里专家类型逐层混排（盘上偏移实测，均为 838,860,800 值/块）：
+;   gate/up 96 块（256 值超块族）：IQ3_XXS 98B/256 ×34、IQ3_S 110B/256 ×20、
+;     IQ2_S 82B/256 ×40、IQ4_XS 136B/256 ×2
+;   down 48 块（小分组族）：IQ4_NL 18B/32 ×39、Q2_0(自定义 type42) 18B/64 ×9
+; 合计 50,297,033,300 B ≈ 46.84 GiB；加上常驻小权重 5.16 GiB ≈ 52 GiB
+; （64 GiB 卡放得下，余量给 session/激活/PLE 按需读）。
+; 尺寸靠 gguflib.c 类型表（iq4_nl 已修 32/18、q2_0 补 64/18，见那张表）。
+; 占位块无读者、装不装载都不影响现路径；装载策略（全装常驻/按需流式）
+; 随 MoE kernel 接入再定。注意 IQ 族/Q2_0 是码本或非 K 超块量化，与已搬的
+; Q4_K/Q6_K 不同族——dq 家族届时要添新原语，且逐层类型不同、要类型分派
+%for 0 47
+'blk.%%.ffn_gate_exps.weight' dup2 gguf.probe cuda.alloc swap !
+'blk.%%.ffn_up_exps.weight'   dup2 gguf.probe cuda.alloc swap !
+'blk.%%.ffn_down_exps.weight' dup2 gguf.probe cuda.alloc swap !
 %endf
 
 ; ---- GDN 线性注意力层（36 层）：attn_gate/qkv + ssm 全家（9 个/层）----
@@ -388,7 +407,8 @@
 
 ; ---- 每token账：残差 134K + GDN 143K + QSA 90K + MoE 196K ≈ 563 KB ----
 ; ---- （MoE 含 parts T×K×N=100K/token，初版账漏了它）----
-; ---- CS=2048 时合计约 1.1 GiB；稳定后可把 GDN/QSA/MoE 三组暂存 ----
+; ---- CS=2048 时合计约 1.24 GiB（残差/超连接 264 MiB + GDN 330 MiB + ----
+; ---- QSA 173 MiB + MoE 471 MiB）；稳定后可把三组暂存 ----
 ; ---- 合并成 max() 一块轮用，省约一半 ----
 
 ; 残差栈 / 超连接
@@ -423,16 +443,24 @@
 'CS' @  512   * 4 * cuda.alloc 'pf.qsa.qidx'  !  ; indexer 查询向量（4 头 × 128，norm 后）
 'CS' @  'SEL' @ * 4 * cuda.alloc 'pf.qsa.ids'  !  ; 选中 cell 号 int32
 
-; MoE 暂存
-'CS' @  'NE' @ * 4 *       cuda.alloc 'pf.moe.logits' !  ; 路由 logits
-'CS' @  'K'  @ * 8 *       cuda.alloc 'pf.moe.idsw'    !  ; top-k id(int32)+权重(f32) 同块
-'CS' @  'K'  @ * 1280 * 4 * cuda.alloc 'pf.moe.gu'     !  ; 激活后 gate|up 行
-'CS' @  'K'  @ * 640  * 4 * cuda.alloc 'pf.moe.h'      !  ; SwiGLU 中间
-'CS' @  'K'  @ * 'N'  @ * 4 * cuda.alloc 'pf.moe.parts' !  ; 各专家输出 (CS,K,N)，combine 的输入——MoE 最大一项
-'CS' @  'N'  @ * 4 *       cuda.alloc 'pf.moe.out'     !  ; combine（共享专家原地）
-'CS' @  640 * 4 * cuda.alloc 'pf.moe.shH'   !  ; 共享专家 SwiGLU 中间 f32（gate|up 可原地）
-'CS' @  640 * 2 * cuda.alloc 'pf.moe.shH16' !  ; 共享专家 down 入参 bf16 像（契约）
-'CS' @  4 *       cuda.alloc 'pf.moe.shg'   !  ; 共享专家标量门 f32（每 token 一个）
+; MoE 暂存（do_moe_layer 契约：ids/w/slot/src 四表 + 收行 xs + 逐专家行缓冲；
+; dqgu/dqd 是反量化 scratch，不随 CS——逐专家现解现用）
+'CS' @  'NE' @ * 4 *       cuda.alloc 'pf.moe.logits' !  ; 路由 logits (CS,NE) f32
+'CS' @  'K'  @ * 4 *       cuda.alloc 'pf.moe.ids'    !  ; top-k 专家 id (CS,K) int32
+'CS' @  'K'  @ * 4 *       cuda.alloc 'pf.moe.w'      !  ; 选中集归一权重 (CS,K) f32
+'CS' @  'K'  @ * 4 *       cuda.alloc 'pf.moe.slot'   !  ; 分组表 (t,k)→Dm 行 int32
+'CS' @  'K'  @ * 4 *       cuda.alloc 'pf.moe.src'    !  ; 分组表 Dm 行→token int32
+'CS' @  'K'  @ * 'N'  @ * 2 * cuda.alloc 'pf.moe.xs'   !  ; 收行后的混合输入 (CS·K,N) f16
+'CS' @  'K'  @ * 1280 * 4 * cuda.alloc 'pf.moe.gu'     !  ; gate|up 交错行 (CS·K,2·640) f32
+'CS' @  'K'  @ * 640  * 2 * cuda.alloc 'pf.moe.h'      !  ; SwiGLU 中间 (CS·K,640) f16
+'CS' @  'K'  @ * 'N'  @ * 4 * cuda.alloc 'pf.moe.parts' !  ; 各专家输出 (CS·K,N) f32，combine 的输入——MoE 最大一项
+'N' @ 1280 * 2 *           cuda.alloc 'pf.moe.dqgu'   !  ; 专家 gate|up 反量化 f16 (1280,N)——down GEMM 前作废
+'N' @ 640 * 2 *            cuda.alloc 'pf.moe.dqd'    !  ; down 反量化 f16（共享 up/共享 down/逐专家 down 轮用）
+'CS' @  640 * 4 *          cuda.alloc 'pf.moe.sgate'  !  ; 共享专家 gate 投影 (CS,640) f32
+'CS' @  640 * 4 *          cuda.alloc 'pf.moe.sup'    !  ; 共享专家 up 投影 (CS,640) f32
+'CS' @  640 * 2 *          cuda.alloc 'pf.moe.shH16'  !  ; 共享专家 SwiGLU 中间 (CS,640) f16（down 投影入参）
+'CS' @  'N'  @ * 4 *       cuda.alloc 'pf.moe.out'    !  ; 共享专家输出=combine 原地 (CS,N) f32
+'CS' @  4 *                cuda.alloc 'pf.moe.shg'    !  ; 共享专家标量门 f32（每 token 一个）
 
 
 ; ============================================================================

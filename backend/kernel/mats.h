@@ -69,6 +69,36 @@ struct Mats {
     float* gdnBo;               // "pf.emb" 别名 (T,N)：块输出落在 embedding 缓冲
     float* gdnState;            // "gdn.S"   layer 0 基址（session view）
     float* gdnConvHist;         // "gdn.conv" layer 0 基址（session view）
+    // ---- 超连接读（层 0 ffn 半；scratch 与 attn 半共用——同流按序，不重叠）----
+    const float*    hcFfnNorm;  // blk.0.hc_ffn_norm.weight   (HC,N)  f32
+    const uint16_t* hcFfnDown;  // blk.0.hc_ffn_down.weight   (LR,D)  bf16
+    const uint16_t* hcFfnUp;    // blk.0.hc_ffn_up.weight     (D,LR)  bf16
+    const uint16_t* hcFfnInj;   // blk.0.hc_ffn_inject.weight (HC,D)  bf16
+    // ---- MoE 块（layer 0；层循环接入后按 48 层类型表参数化）----
+    const uint16_t* moeRouter;  // blk.0.ffn_gate_inp.weight        (NE,N)  BF16
+    const uint16_t* moeShGateW; // blk.0.ffn_gate_inp_shexp.weight (N,)    BF16 标量门
+    const uint8_t* expGate;     // blk.0.ffn_gate_exps.weight  (NE,FF,N) IQ3_XXS
+    const uint8_t* expUp;       // blk.0.ffn_up_exps.weight    (NE,FF,N) IQ3_XXS
+    const uint8_t* expDown;     // blk.0.ffn_down_exps.weight  (NE,N,FF) IQ4_NL
+    const uint8_t* shGate;      // blk.0.ffn_gate_shexp.weight (FF,N)  Q4_K
+    const uint8_t* shUp;        // blk.0.ffn_up_shexp.weight   (FF,N)  IQ4_XS
+    const uint8_t* shDown;      // blk.0.ffn_down_shexp.weight (N,FF)  IQ4_NL
+    float* moeLogits;           // "pf.moe.logits" (CS,NE)  f32 路由 logits
+    int32_t* moeIds;            // "pf.moe.ids"    (CS,K)   i32 专家 id
+    float* moeW;                // "pf.moe.w"      (CS,K)   f32 归一权重
+    int32_t* moeSlot;           // "pf.moe.slot"   (CS*K)   i32 (t,k)→Dm 行
+    int32_t* moeSrc;            // "pf.moe.src"    (CS*K)   i32 Dm 行→token
+    uint16_t* moeXs;            // "pf.moe.xs"     (CS*K,N) f16 收行
+    float* moeGu;               // "pf.moe.gu"     (CS*K,2FF) f32 gate|up 交错行
+    uint16_t* moeHh;            // "pf.moe.h"      (CS*K,FF) f16 SwiGLU 中间
+    float* moeDm;               // "pf.moe.parts"  (CS*K,N)  f32 各专家输出
+    uint16_t* moeDqGu;          // "pf.moe.dqgu"   (2FF,N)   f16 专家反量化 scratch
+    uint16_t* moeDqD;           // "pf.moe.dqd"    (N·FF)    f16 down 反量化 scratch
+    float* moeSgate;            // "pf.moe.sgate"  (CS,FF)   f32 共享 gate 投影
+    float* moeSup;              // "pf.moe.sup"    (CS,FF)   f32 共享 up 投影
+    uint16_t* moeShh;           // "pf.moe.shH16"  (CS,FF)   f16 共享 SwiGLU 中间
+    float* moeOut;              // "pf.moe.out"    (CS,N)    f32 shared=bo 原地 combine
+    float* moeSg;               // "pf.moe.shg"    (CS,)     f32 标量门
 };
 
 // 现取全部材料（含权重字节哨兵）。构建成本 ~50 次 hash 查找——除 the_mats

@@ -1,11 +1,13 @@
 // ===========================================================================
 // prefill.cpp — prefill 两条路径的大入口：纯组装（g++ 编译，不含 kernel）
 // ===========================================================================
-// 一拍 = 窗口内 token 的 embedding（do_embed，真计算）+ 第 0 层 attn 半的
-// 超连接读（do_gr_read）→ GDN 线性注意力（do_gdn_layer）→ 残差写回
-// （do_gr_write，attn 半闭环：bo 落栈）+ 余下层栈（当前 do_dummy 占位，
-// 真 kernel 逐步接入后在此排进组装序列）。组装材料从材料箱取——the_mats
-// 首拍一次构建、之后每拍奉还
+// 一拍 = 窗口内 token 的 embedding（do_embed，真计算）+ 第 0 层整层：
+// attn 半超连接读（do_gr_read）→ GDN 线性注意力（do_gdn_layer）→ 残差写回
+// （do_gr_write，attn 半闭环：bo 落栈）；ffn 半同款读（do_gr_read，scratch
+// 与 attn 半共用——同流按序不重叠）→ MoE（do_moe_layer，shared 与 bo 同
+// 缓冲原地 combine）→ 残差写回（ffn 半闭环）+ 余下层栈（当前 do_dummy 占
+// 位，真 kernel 逐步接入后在此排进组装序列）。组装材料从材料箱取——
+// the_mats 首拍一次构建、之后每拍奉还
 // （结构与契约见 mats.h）；本文件只按序调 all.cuh 的小入口——发射细节
 // （SM 铺满、<<<>>>）都在各小入口的 .cu 里，所以它是 .cpp。
 // ===========================================================================
@@ -33,6 +35,15 @@ void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff) {
                  m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
                  m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
     do_gr_write(m.inputLeft, m.inputRight, m.gdnBo, m.inj, m.res, m.stream);   // attn 半收尾：bo 落栈
+    do_gr_read(m.inputLeft, m.inputRight, m.hcFfnNorm, m.hcFfnDown, m.hcFfnUp, m.hcFfnInj,
+               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.mixedh, m.stream);
+    do_moe_layer(m.inputLeft, m.inputRight,
+                 m.moeRouter, m.moeShGateW, m.expGate, m.expUp, m.expDown,
+                 m.shGate, m.shUp, m.shDown, m.mixed16, m.mixedh,
+                 m.moeLogits, m.moeIds, m.moeW, m.moeSlot, m.moeSrc, m.moeXs,
+                 m.moeGu, m.moeHh, m.moeDm, m.moeDqGu, m.moeDqD,
+                 m.moeSgate, m.moeSup, m.moeShh, m.moeOut, m.moeSg, m.moeOut, m.stream);
+    do_gr_write(m.inputLeft, m.inputRight, m.moeOut, m.inj, m.res, m.stream);  // ffn 半收尾：bo 落栈
     do_dummy(m.stream, m.outputCmd, 1);    // 占位层栈（分诊值：chunking=1）
 }
 
@@ -48,6 +59,15 @@ void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
                  m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
                  m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
     do_gr_write(m.inputLeft, m.inputRight, m.gdnBo, m.inj, m.res, m.stream);   // attn 半收尾：bo 落栈
+    do_gr_read(m.inputLeft, m.inputRight, m.hcFfnNorm, m.hcFfnDown, m.hcFfnUp, m.hcFfnInj,
+               m.res, m.grs, m.xn16, m.lo, m.lo16, m.gated, m.inj, m.mixed, m.mixed16, m.mixedh, m.stream);
+    do_moe_layer(m.inputLeft, m.inputRight,
+                 m.moeRouter, m.moeShGateW, m.expGate, m.expUp, m.expDown,
+                 m.shGate, m.shUp, m.shDown, m.mixed16, m.mixedh,
+                 m.moeLogits, m.moeIds, m.moeW, m.moeSlot, m.moeSrc, m.moeXs,
+                 m.moeGu, m.moeHh, m.moeDm, m.moeDqGu, m.moeDqD,
+                 m.moeSgate, m.moeSup, m.moeShh, m.moeOut, m.moeSg, m.moeOut, m.stream);
+    do_gr_write(m.inputLeft, m.inputRight, m.moeOut, m.inj, m.res, m.stream);  // ffn 半收尾：bo 落栈
     do_dummy(m.stream, m.outputCmd, 2);    // 占位层栈（分诊值：chunked=2）
 }
 
