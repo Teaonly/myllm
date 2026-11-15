@@ -39,7 +39,7 @@ void Scheduler::init_config(CudaEnv* env) {
     staff_.inputRight    = static_cast<int*>(hash.find_tensor("staff.inputRight")->data());
 
     // 出口侧三词：kernel 写 token/数目，host 在 beat_device 里收割
-    staff_.outputTokens = static_cast<int*>(hash.find_tensor("staff.outputTokens")->data());
+    staff_.ioTokens = static_cast<int*>(hash.find_tensor("staff.ioTokens")->data());
     staff_.outputNumber = static_cast<int*>(hash.find_tensor("staff.outputNumber")->data());
     staff_.outputCmd    = static_cast<int*>(hash.find_tensor("staff.outputCmd")->data());
 
@@ -172,7 +172,6 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     if (cudaStreamWaitEvent(staff_.execStream, staff_.h2dEvent, 0) != cudaSuccess) {
         vt_panic("push_device: execStream wait on h2dEvent failed");
     }
-    *staff_.outputCmd  = 0;
     if (state_ == SchedulerState::CHUNKING) {
         kern::do_prefill_chunking(env, staff_);
     } else {
@@ -201,11 +200,15 @@ void Scheduler::beat_device(CudaEnv* env) {
         return;
     }
 
-    // exec 流排空同步：上一拍发射的计算完工 = 完工旗立起。轮询旗而非
-    // cudaStreamSynchronize 阻塞——主循环下一拍照常接 stdin，abort/新
-    // 消息不会被一个长负载卡住。旗未立 = 还在算，本拍到此为止
-    if (*staff_.outputCmd == 0) {
-        return;
+    // 查询式探测 execStream 是否排空：cudaSuccess = 在排的全部 kernel
+    // 完工，cudaErrorNotReady = 还在算。非阻塞——主循环下一拍照常接
+    // stdin，abort/新消息不会被长负载卡住。其余返回值 = 在途 kernel
+    // 出了真事故（错误是粘性的），fail fast
+    cudaError_t q = cudaStreamQuery(staff_.execStream);
+    vt_assert(q == cudaSuccess || q == cudaErrorNotReady,
+              "beat_device: execStream query failed");
+    if (q == cudaErrorNotReady) {
+        return;    // 还在算，本拍到此为止
     }
 
     if (state_ == SchedulerState::CHUNKING) {
@@ -213,11 +216,9 @@ void Scheduler::beat_device(CudaEnv* env) {
         // 否则转 CHUNKED——最后一拍一拍吃完余量、drain 出首 token
         *staff_.inputLeft += cfg_.prefillChunkSize;
         if (*staff_.inputRight - *staff_.inputLeft > cfg_.prefillChunkSize) {
-            *staff_.outputCmd = 0;
             kern::do_prefill_chunking(env, staff_);
         } else {
             state_ = SchedulerState::CHUNKED;
-            *staff_.outputCmd = 0;
             kern::do_prefill_chunked(env, staff_);
         }
         return;

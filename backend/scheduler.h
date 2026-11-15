@@ -38,7 +38,7 @@ struct SchedulerStaff {
     volatile int* inputLeft = nullptr;       // 输入窗口左沿（绝对坐标）：待喂入游标 = 已算过数
     volatile int* inputRight = nullptr;      // 输入窗口右沿（绝对坐标）：prompt 末 = one-past-end
 
-    volatile int* outputTokens = nullptr;    // kernel 写出的 token 队列（16 词出口缓冲）
+    volatile int* ioTokens = nullptr;        // kernel 读取写出的 token 队列（16 词进出口缓冲）
     volatile int* outputNumber = nullptr;    // 本批写出的 token 数（kernel 写，host 收割）
     volatile int* outputCmd = nullptr;       // 出口侧命令字（预留）
 };
