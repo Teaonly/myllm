@@ -10,6 +10,8 @@
 #     *.cu      实现件：一主题一文件（kernel 实现 + do_* 发射器，
 #               embed/dummy/dq/...），跨主题复用的设备函数独立成文件
 #               （dq.cu）；新增 .cu 自动进编译（wildcard 收集）
+#     mats.h/cpp 组装材料箱（g++ 侧）：Mats 结构 + collect_mats 现取 +
+#               the_mats 一次构建缓存——prefill/decode 组装件共用
 #     prefill.cpp 组装件（g++ 侧）：大入口的实现，只按序调 do_* 小入口
 # - opt/gguf 是 antirez 的 C 库（GGUF 解析），gcc 直接编
 # - 产物统一放 build/（根 .gitignore 已忽略），源码目录保持干净
@@ -27,7 +29,7 @@ NVCCFLAGS := -std=c++17 -O0 -g -arch=sm_80 -I. -Xcompiler -Wall
 
 BIN   := build/backend
 SRCS  := main.cpp scheduler.cpp protocol.cpp cache.cpp vt/vt_gguf.cpp \
-         kernel/prefill.cpp   # g++ 侧源文件，往这列里加（prefill.cpp=kernel/ 组装件）
+         kernel/mats.cpp kernel/prefill.cpp   # g++ 侧源文件，往这列里加（kernel/ 组装件：mats.cpp=材料箱、prefill.cpp=序列）
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
 KRNLS := $(patsubst %.cu,build/%.o,$(wildcard kernel/*.cu))  # kernel/*.cu 全收
 DLNK  := build/kernel/dlink.o                    # 设备链接块（-rdc 收尾）
