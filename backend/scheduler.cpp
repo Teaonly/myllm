@@ -156,7 +156,7 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     char* slot = static_cast<char*>(staff_.allSessions) + cfg_.sessionSize * target;
     std::memcpy(slot, worker_.input_ids.data(), worker_.input_ids.size() * sizeof(int32_t));
 
-    if (*staff_.targetSession != target) {
+    if (*staff_.targetSession != target || matched == 0) {
         if (cudaMemcpyAsync(staff_.deviceSession, slot, cfg_.sessionSize,
                             cudaMemcpyHostToDevice, staff_.h2dStream) != cudaSuccess) {
             vt_panic("push_device: session slab H2D failed");
