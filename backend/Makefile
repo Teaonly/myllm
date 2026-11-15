@@ -51,22 +51,12 @@ clean:
 
 # host 侧单元测试（无 GPU / 无 CUDA；被测源码直接编入测试目标——库目标待
 # 模块成形再拆）。跑法：make test
-build/scheduler_test: test/scheduler_test.cpp scheduler.cpp protocol.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -o $@ $^
-
-# SessionCache 单测（无 GPU）。跑法：make cache_test
-# （test 聚合暂被 scheduler_test 旧 API 滞后拖住，本目标独立可跑）
-build/cache_test: test/cache_test.cpp cache.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -o $@ $^
-
-cache_test: build/cache_test
-	build/cache_test
-
-test: build/scheduler_test
-	build/scheduler_test
+HOLD ?= 45
+test_single: $(BIN)
+	( cat test/single.ndjson; sleep $(HOLD); \
+	  printf '{"__type__":"ExitMsg"}\n' ) | $(BIN); \
+	st=$$?; case $$st in 1|254) ;; *) exit $$st ;; esac
 
 -include $(DEPS)
 
-.PHONY: clean test
+.PHONY: clean test_single

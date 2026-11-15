@@ -514,7 +514,7 @@
 4 host.alloc "staff.inputLeft" !
 4 host.alloc "staff.inputRight" !
 
-16 * 4 host.alloc "staff.ioTokens" !
+16 4 * host.alloc "staff.ioTokens" !
 4 host.alloc "staff.outputNumber" !
 4 host.alloc "staff.outputCmd" !
 
