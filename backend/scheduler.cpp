@@ -172,10 +172,11 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     if (cudaStreamWaitEvent(staff_.execStream, staff_.h2dEvent, 0) != cudaSuccess) {
         vt_panic("push_device: execStream wait on h2dEvent failed");
     }
+    *staff_.outputCmd  = 0;
     if (state_ == SchedulerState::CHUNKING) {
-        kern::do_prefill_chunking(env, staff_.inputLeft, staff_.inputRight);
+        kern::do_prefill_chunking(env, staff_);
     } else {
-        kern::do_prefill_chunked(env, staff_.inputLeft, staff_.inputRight);
+        kern::do_prefill_chunked(env, staff_);
     }
 }
 
@@ -184,9 +185,9 @@ void Scheduler::pull_device(CudaEnv* env, AbortMsg& m) {
     if (state_ == SchedulerState::IDLE || worker_.uid != m.uid) {
         return;
     }
-    // 骨架期事实：计算还没接上，开工后一个新 token 都没算——镜像与
-    // 账面均未动过，活动槽旧 prefix 原样落账、释放活动（账实相符）。
-    // beat_device 接上后改落 tokens[0..head)。
+    // dummy 期事实：负载 kernel 不产 token，镜像账面没动过——活动槽旧
+    // prefix 原样落账、释放活动（账实相符）。真 kernel 接入后改落
+    // tokens[0..head)。
     cache_.finish( cache_.prefix( cache_.active_slot() ) );
     worker_ = SessionWorker{};    // 清回无主（uid=0）
     state_ = SchedulerState::IDLE;
@@ -200,8 +201,39 @@ void Scheduler::beat_device(CudaEnv* env) {
         return;
     }
 
-    
+    // exec 流排空同步：上一拍发射的计算完工 = 完工旗立起。轮询旗而非
+    // cudaStreamSynchronize 阻塞——主循环下一拍照常接 stdin，abort/新
+    // 消息不会被一个长负载卡住。旗未立 = 还在算，本拍到此为止
+    if (*staff_.outputCmd == 0) {
+        return;
+    }
 
+    if (state_ == SchedulerState::CHUNKING) {
+        // 一块喂完：窗口左沿前进一个 chunk。余量仍超 CS 就继续分块喂；
+        // 否则转 CHUNKED——最后一拍一拍吃完余量、drain 出首 token
+        *staff_.inputLeft += cfg_.prefillChunkSize;
+        if (*staff_.inputRight - *staff_.inputLeft > cfg_.prefillChunkSize) {
+            *staff_.outputCmd = 0;
+            kern::do_prefill_chunking(env, staff_);
+        } else {
+            state_ = SchedulerState::CHUNKED;
+            *staff_.outputCmd = 0;
+            kern::do_prefill_chunked(env, staff_);
+        }
+        return;
+    }
+
+    if (state_ == SchedulerState::CHUNKED) {
+        // prefill 全程完工（dummy 未真算 token）。decode kernel 未接，先
+        // 收尾会话：账本按"算到 prompt 末"落账、清台回 IDLE——
+        // TODO decode 接入后这里改转 DECODING 逐拍生成回填
+        cache_.finish( std::move(worker_.input_ids) );
+        worker_ = SessionWorker{};
+        state_ = SchedulerState::IDLE;
+        return;
+    }
+
+    // DECODING：decode kernel 接入后逐拍生成（每拍 DT 个）回填再喂
     return;
 }
 
