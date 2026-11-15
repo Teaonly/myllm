@@ -144,7 +144,7 @@ void Scheduler::push_device(CudaEnv* env, UserMsg& m) {
     *staff_.inputLeft = matched;
     *staff_.inputRight = (int)worker_.input_ids.size();
 
-    LOG("Push Device");
+    LOG("Push Device: left = %d, right = %d", *staff_.inputLeft, *staff_.inputRight);
 
     // 镜像槽基址 = staff.sessions + SSIZE × target：ids 区在槽首（偏移 0），
     // 新 prompt 先落镜像（H2D 集散地）；[0,matched) 段重写同值，无害

@@ -15,4 +15,9 @@ namespace kern {
 void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff);
 void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff);
 
+// embedding gather（kernel/embed.cpp）：窗口 [inputLeft,inputRight) 取
+// min(CS, 余量) 个 token，Q6_K 词表行解进 pf.emb，广播进 pf.R (T,HC,N)。
+// 调试落盘：MYLLM_EMBED_DUMP=<path> 同步写 pf.emb 前 T 行裸 f32
+void do_embed(CudaEnv* env, myllm::SchedulerStaff& staff);
+
 }  // namespace kern

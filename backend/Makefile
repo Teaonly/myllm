@@ -22,7 +22,7 @@ BIN   := build/backend
 SRCS  := main.cpp scheduler.cpp protocol.cpp cache.cpp vt/vt_gguf.cpp  # g++ 侧源文件，往这列里加
 CSRCS := opt/gguf/gguflib.c opt/gguf/fp16.c      # C 库
 OBJS  := $(patsubst %.cpp,build/%.o,$(SRCS)) build/vt/vt_cuda.o \
-         build/kernel/prefill.o $(patsubst %.c,build/%.o,$(CSRCS))
+         build/kernel/prefill.o build/kernel/embed.o $(patsubst %.c,build/%.o,$(CSRCS))
 DEPS  := $(OBJS:.o=.d)
 
 $(BIN): $(OBJS)
@@ -41,8 +41,12 @@ build/vt/vt_cuda.o: vt/vt_cuda.cpp vt/vt_cuda.hpp vt/vt.hpp
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-# kernel/prefill.o：同上——nvcc -x cu，头文件依赖手写
+# kernel/prefill.o、kernel/embed.o：同上——nvcc -x cu，头文件依赖手写
 build/kernel/prefill.o: kernel/prefill.cpp kernel/index.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+build/kernel/embed.o: kernel/embed.cpp kernel/index.h
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 

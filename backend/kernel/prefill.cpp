@@ -55,12 +55,12 @@ void launch_dummy(myllm::SchedulerStaff& staff, int outValue) {
 }  // namespace
 
 void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff) {
-    (void)env;    // 真实版：env->hash() 取形状；输入窗口 [inputLeft,inputRight) 定工作量
+    do_embed(env, staff);    // 真计算第一件：窗口内 token 的 embedding → pf.emb/pf.R
     launch_dummy(staff, 1);
 }
 
 void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
-    (void)env;
+    do_embed(env, staff);    // 末块同路：embed 完余下的是层栈与 head，dummy 暂代
     launch_dummy(staff, 2);
 }
 
