@@ -13,6 +13,12 @@
 #include "vt_cuda.hpp"
 #include "vt_gguf.hpp"
 
+// view 基址对齐契约（闸在 CudaTensor view 构造函数，详注在那里）：
+// 256B = cudaMalloc 返回地址的保证粒度，view 基址同对齐后与真身对齐等价，
+// kernel 无需分辨 view 还是 alloc，任何向量宽度（16/32/128B）都安全。
+// 不取 8B：挡不住 float4 向量读的 misaligned fault。
+constexpr size_t VIEW_ALIGN = 256;
+
 // ---------------------------------------------------------------------------
 // 1. CudaContext —— 打开一台设备，建好流与事件的池子，常驻到析构
 
@@ -103,6 +109,12 @@ CudaTensor::CudaTensor(std::shared_ptr<CudaTensor> owner, size_t offset, size_t 
       view_(true),
       // 视图的视图也扁平指向真身：owner 链永远只有一层
       owner_(owner->view_ ? owner->owner_ : owner) {
+
+    if (offset % VIEW_ALIGN != 0) {
+        std::cerr << "CudaTensor view: offset " << offset << " not " << VIEW_ALIGN
+                  << "B aligned (owner base " << owner->data_ << ")\n";
+        vt_panic("CudaTensor view: offset must be 256B aligned");
+    }
 }
 
 CudaTensor::~CudaTensor() {
@@ -248,6 +260,7 @@ struct SizeWord : vt::NativeWord<CudaTensor> {
 //   纯栈操作不碰 CUDA（不分配不拷贝），不需要 ctx，所以是 LR 形态。
 //   owner_ 钉住真身：view 活着真身就不会被释放，地址永远有效。
 //   越界即 panic：坏 view 会让后续写词踩到别人的显存
+//   （offset 的对齐闸在 CudaTensor view 构造函数，一处总闸）
 struct ViewWord : vt::NativeWord<CudaTensor> {
     static vt::NativeWord<CudaTensor>* creator(CudaEnv&) { return new ViewWord(); }
 
