@@ -1,6 +1,7 @@
 // ===========================================================================
-// gr.cu — 超连接读（hyper-connection read）主题：gr_norm_rs / gr_silu /
-//         gr_mix_r 三个 kernel + bf16 GEMM（cuBLAS）+ do_gr_read 发射器
+// gr.cu — 超连接（hyper-connection）读/写主题：gr_norm_rs / gr_silu /
+//         gr_mix_r / gr_write 四个 kernel + bf16 GEMM（cuBLAS）+
+//         do_gr_read / do_gr_write 发射器
 // ===========================================================================
 // 一个 half（attn 或 ffn）的残差读，计算逐字跟随 Strata：
 //   kernel  src/prefill/kernels.cu  gr_norm_rs_kernel(:129) gr_silu_kernel(:269)
@@ -19,6 +20,11 @@
 //   5. inject GEMM：xn16 (T,D) × wi (HC,D)ᵀ → inj (T,HC)——inject 是每 token
 //      的真投影（10240→4），不是每层常量，block_inject_weight 这名字骗人
 //   6. gr_mix_r   ：mixed = Σ_c (R·grs·w)_c · σ(gated_c) / HC——均值不是和
+// 写回（一个 half 的收尾，prefill.cpp:5612 段的编排）：
+//   gr_write：R[t,c,:] += bo[t,:]·2σ(inj[t,c]/HC)——块输出按流增益落残差栈
+//   （kernels.cu:300）。未搬分叉：F-2 融合 gr_write_norm_rs（:174，写回 +
+//   下一半的 gr_norm_rs 一遍过，same bits——层循环接入时若要，须给
+//   do_gr_read 开"norm 已跑"模式）与 cvec steer 融合（:211，控制向量专属）
 // 权重契约（IQ3_S 包 tensor-allocation 实测 + Strata ne0/ne1 断言反推）：
 //   norm  (HC,N)  F32   键内即 1+w（hc_norm 存 1+w，乘即用，不另加 1）
 //   down  (LR,D)  BF16  行主序按出维排：w[oy*K+k]，K=D
@@ -181,6 +187,16 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
     mixed_h[i] = hf(s);
 }
 
+// R[t,c,:] += bo[t,:]·2σ(inj[t,c]/HC)（kernels.cu:300）。/HC 在 σ 里面
+// （与 gr_silu 同约定：增益是 2·σ(注入/流数)）
+__global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
+                                int64_t inj_ld, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * D) return;
+    const int64_t t = i / D, c = (i % D) / N, d = i % N;
+    R[i] = fmaf(bo[t * N + d], 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
+}
+
 // ---- 发射器：一个 half 的完整读，六步按序 ----
 void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
                 const float* wNorm,     // (HC,N)  f32   blk.%%.hc_{attn,ffn}_norm.weight
@@ -220,6 +236,20 @@ void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
     // 6. mix：均值出 mixed（f32 + bf16/f16 两像：bf16 喂 router/α/β，f16 喂 native 投影）
     gr_mix_r_kernel<<<blocks_for((int64_t) T * N), 256, 0, stream>>>(R, grs, wNorm, gated, mixed, mixed16, mixedh, T);
     check_launch("gr_mix_r");
+}
+
+// ---- 发射器：残差写回（一个 half 的收尾，一步）----
+void do_gr_write(volatile int* inputLeft, volatile int* inputRight,
+                 const float* bo,   // (T,N) 块输出：attn 半 = GDN 的 ssm_out 出（pf.emb 别名）
+                 const float* inj,  // (T,HC) 本半的每流注入（do_gr_read 步 5 的出）
+                 float* R,          // (T,HC,N) 残差栈，就地累加
+                 cudaStream_t stream) {
+    const int cs = model::CS;
+    const int left = *inputLeft, right = *inputRight;
+    const int T = right - left > cs ? cs : right - left;
+    if (T <= 0) return;
+    gr_write_kernel<<<blocks_for((int64_t) T * D), 256, 0, stream>>>(R, bo, inj, HC, T);
+    check_launch("gr_write");
 }
 
 }  // namespace kern

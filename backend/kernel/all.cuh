@@ -60,6 +60,12 @@ void do_gr_read(volatile int* inputLeft, volatile int* inputRight,
                 float* lo, uint16_t* lo16, float* gated, float* inj,
                 float* mixed, uint16_t* mixed16, uint16_t* mixedh, cudaStream_t stream);
 
+// 残差写回（kernel/gr.cu）：R += bo·2σ(inj/HC)——一个 half 的收尾，块输出
+// 按流增益落残差栈。inj 是同半 do_gr_read 步 5 的出（写回与读共用一份）；
+// F-2 融合变体（写 + 下一半 norm 一遍过，same bits）未搬，契约见 gr.cu 头注
+void do_gr_write(volatile int* inputLeft, volatile int* inputRight,
+                 const float* bo, const float* inj, float* R, cudaStream_t stream);
+
 // GDN 线性注意力层（kernel/gdn.cu，layer 0 专用——层循环接入时参数化）：
 // mixed 两像 → qkv/gate/α/β 四投影 → gates → conv+SiLU+L2 → 递归+输出
 // norm → ssm_out 投影 → bo。state/convHist 是 session view 的 layer 0 基址
@@ -133,7 +139,7 @@ __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restri
                                     int64_t n, int64_t d, int64_t T);
 
 // ---------------------------------------------------------------------------
-// kernel 原型：超连接读主题（实现 kernel/gr.cu）
+// kernel 原型：超连接读/写主题（实现 kernel/gr.cu）
 // ---------------------------------------------------------------------------
 
 // 逐流 RMSNorm：一行 (t*HC+c) 一块，出行尺度 rs + bf16 像 xn16（不写 f32
@@ -149,6 +155,11 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
                                 uint16_t* __restrict__ mixed_h, int64_t T);
+
+// R[t,c,:] += bo[t,:]·2σ(inj[t,c]/HC)（kernels.cu:300）——写回，inj_ld 是注入
+// 行距（myllm 恒 HC，留形随原文）
+__global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
+                                int64_t inj_ld, int64_t T);
 
 // ---------------------------------------------------------------------------
 // kernel 原型：GDN 线性注意力主题（实现 kernel/gdn.cu）

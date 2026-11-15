@@ -2,9 +2,10 @@
 // prefill.cpp — prefill 两条路径的大入口：纯组装（g++ 编译，不含 kernel）
 // ===========================================================================
 // 一拍 = 窗口内 token 的 embedding（do_embed，真计算）+ 第 0 层 attn 半的
-// 超连接读（do_gr_read，真计算）+ 第 0 层 GDN 线性注意力（do_gdn_layer，
-// 真计算）+ 余下层栈（当前 do_dummy 占位，真 kernel 逐步接入后在此排进
-// 组装序列）。组装材料从材料箱取——the_mats 首拍一次构建、之后每拍奉还
+// 超连接读（do_gr_read）→ GDN 线性注意力（do_gdn_layer）→ 残差写回
+// （do_gr_write，attn 半闭环：bo 落栈）+ 余下层栈（当前 do_dummy 占位，
+// 真 kernel 逐步接入后在此排进组装序列）。组装材料从材料箱取——the_mats
+// 首拍一次构建、之后每拍奉还
 // （结构与契约见 mats.h）；本文件只按序调 all.cuh 的小入口——发射细节
 // （SM 铺满、<<<>>>）都在各小入口的 .cu 里，所以它是 .cpp。
 // ===========================================================================
@@ -31,6 +32,7 @@ void do_prefill_chunking(CudaEnv* env, myllm::SchedulerStaff& staff) {
                  m.mixedh, m.mixed16, m.gdnW16,
                  m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
                  m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
+    do_gr_write(m.inputLeft, m.inputRight, m.gdnBo, m.inj, m.res, m.stream);   // attn 半收尾：bo 落栈
     do_dummy(m.stream, m.outputCmd, 1);    // 占位层栈（分诊值：chunking=1）
 }
 
@@ -45,6 +47,7 @@ void do_prefill_chunked(CudaEnv* env, myllm::SchedulerStaff& staff) {
                  m.mixedh, m.mixed16, m.gdnW16,
                  m.gdnQkvAct, m.gdnZ, m.gdnAb, m.gdnGateAct, m.gdnBetaAct,
                  m.gdnH, m.gdnY, m.gdnY16, m.gdnBo, m.gdnState, m.gdnConvHist, m.stream);
+    do_gr_write(m.inputLeft, m.inputRight, m.gdnBo, m.inj, m.res, m.stream);   // attn 半收尾：bo 落栈
     do_dummy(m.stream, m.outputCmd, 2);    // 占位层栈（分诊值：chunked=2）
 }
 
