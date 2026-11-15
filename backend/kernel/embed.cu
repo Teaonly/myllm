@@ -21,9 +21,6 @@
 // ===========================================================================
 #include "all.cuh"
 #include "qwen3.8-next.h"
-#include "vt/vt.hpp"    // vt_panic
-
-#include <cstdio>
 
 namespace kern {
 
@@ -66,21 +63,13 @@ void do_embed(volatile int* inputLeft, volatile int* inputRight,  // [left, righ
     // gather：grid=(n/256, T)（n 是 256 整倍，几何保证），32 线程
     embed_rows_kernel<<<dim3((unsigned) (n / 256), (unsigned) T), 32, 0, stream>>>(
         table, (size_t) (n / 256) * sizeof(Q6KBlock), win, n, emb);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "kern: embed gather launch failed: %s\n", cudaGetErrorString(err));
-        vt_panic("kern: embed gather launch failed");
-    }
+    check_launch("embed gather");
 
     // 广播：emb → HC 条残差流
     const int64_t total = (int64_t) T * d;
     gr_broadcast_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, stream>>>(
         emb, res, n, d, T);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "kern: gr_broadcast launch failed: %s\n", cudaGetErrorString(err));
-        vt_panic("kern: gr_broadcast launch failed");
-    }
+    check_launch("gr_broadcast");
 }
 
 }  // namespace kern

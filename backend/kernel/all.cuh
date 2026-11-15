@@ -9,7 +9,9 @@
 //   - 设备函数与小 kernel 的实现在各主题 .cu（embed.cu / dummy.cu / ...），
 //     想看引擎有哪些计算扫这里就够，想看怎么算的跳到对应 .cu；
 //   - 跨主题复用的设备函数独立成文件：如 Q6_K 反量化 dq_q6_k → dq.cu
-//     （embedding 词表与后续量化 GEMM 共用的解码原语）。
+//     （embedding 词表与后续量化 GEMM 共用的解码原语）；
+//   - 例外 host 小辅助 inline 就地（如 check_launch——各主题发射器的
+//     同款收尾，几行不值一个 .cu）。
 // 分两段：host 小入口（do_*，g++/nvcc 都编得了）在前；设备侧原型
 // （__global__/__device__）锁在 __CUDACC__ 段——g++ 不认识这两个限定词，
 // 而组装件（prefill.cpp）只调 do_*，也用不着它们。
@@ -25,6 +27,8 @@
 
 #ifdef __CUDACC__
 #include <cuda_fp16.h>           // __half（Q6KBlock 成员）
+#include <cstdio>               // std::fprintf（check_launch 失败详情）
+#include "vt/vt.hpp"            // vt_panic（check_launch 失败路径）
 #endif
 
 namespace kern {
@@ -121,15 +125,20 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
 // 与旗写缘由见 dummy.cu）
 __global__ void dummy_kernel(int iters, volatile int* outputCmd, int outValue);
 
-// 辅助函数
-void check_launch(const char* what) {
+// ---------------------------------------------------------------------------
+// host 辅助：launch 检查（各主题发射器共用；inline 就地——本头进多个
+// nvcc 编译单元，非 inline 定义会撞链接）
+// ---------------------------------------------------------------------------
+
+// 发射后查 cudaGetLastError：失败打 what 与详情、panic fail fast。
+// 具体 kernel 名看 stderr 首行，panic 文案保持通用
+inline void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "kern: %s launch failed: %s\n", what, cudaGetErrorString(e));
-        vt_panic("kern: gr kernel launch failed");
+        vt_panic("kern: kernel launch failed");
     }
 }
-
 
 #endif  // __CUDACC__
 

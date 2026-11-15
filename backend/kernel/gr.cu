@@ -35,8 +35,6 @@
 // 未搬的 Strata 分叉（都在 CUDA 默认路径之外，prefill.cpp:3724 的条件里）：
 //   FP16 像（gfx11 rocBLAS 专属）、BF16X2 低像（对拍仪表）、WMMA 融合
 //   （STRATA_PF_HCDOWN / gr_upmix）、XN_PAD 行距——本引擎一律 ldx=D。
-// 落盘验证：MYLLM_GR_DUMP=<前缀> 时每步同步落一块裸二进制 + 一行 meta
-// （MYLLM_EMBED_DUMP 先例，调完即撤）。
 // ===========================================================================
 #include "all.cuh"
 #include "qwen3.8-next.h"

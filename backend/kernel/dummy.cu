@@ -9,9 +9,6 @@
 // <<<>>>），发射得住 .cu；do_dummy 原型在 all.cuh 供组装件调用。
 // ===========================================================================
 #include "all.cuh"
-#include "vt/vt.hpp"    // vt_panic
-
-#include <cstdio>
 
 namespace kern {
 
@@ -43,13 +40,7 @@ void do_dummy(cudaStream_t stream, volatile int* outputCmd, int outValue) {
         cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, 0);
     }
     dummy_kernel<<<n_sm * 8, 256, 0, stream>>>(kLoadIters, outputCmd, outValue);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "kern: dummy launch failed: %s\n",
-                     cudaGetErrorString(err));
-        vt_panic("kern: dummy launch failed");
-    }
+    check_launch("dummy");
 }
 
 }  // namespace kern
