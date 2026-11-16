@@ -40,6 +40,16 @@ DEPS  := $(OBJS:.o=.d)
 $(BIN): $(OBJS)
 	$(CXX) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcudadevrt
 
+# parity：层 0 逐位对拍的独立测试入口（kernel/parity_main.cpp，自带 main）。
+# 链主程序的计算件（kernel/* + vt + gguf 库），不链 main/scheduler/protocol/
+# cache——对拍不走协议循环。用法见 parity_main.cpp 头注
+PARITY := build/parity
+POBJS := build/kernel/parity_main.o build/vt/vt_gguf.o build/kernel/mats.o \
+         build/kernel/prefill.o build/vt/vt_cuda.o $(KRNLS) $(DLNK) \
+         $(patsubst %.c,build/%.o,$(CSRCS))
+$(PARITY): $(POBJS)
+	$(CXX) -o $@ $^ -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcudadevrt
+
 build/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
@@ -80,4 +90,6 @@ test_single: $(BIN)
 
 -include $(DEPS)
 
-.PHONY: clean test_single
+parity: $(PARITY)
+
+.PHONY: clean test_single parity

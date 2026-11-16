@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 verify/full_out/
 backend/build/
+verify/dump/
