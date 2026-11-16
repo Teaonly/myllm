@@ -168,13 +168,15 @@ struct IQ4XSBlock {
 };
 static_assert(sizeof(IQ4XSBlock) == 136, "IQ4_XS block must be 136 bytes");
 
-// dq_q6_k / dq_q4_k —— 一个超块（ibs 相对行首）→ yy 起 256 个值。32 线程
-// 轮转覆盖 llama.cpp 的 64 个线程角色。出参模板化（float / __half），
+// dq_q6_k / dq_q4_k / dq_iq4_xs —— 一个超块（ibs 相对行首）→ yy 起 256 个值。
+// 32 线程轮转覆盖 llama.cpp 的 64 个线程角色。出参模板化（float / __half），
 // 显式实例化在 kernel/dq.cu（跨 .cu 引用走设备链接 -dlink）
 template <typename dst_t>
 __device__ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid);
 template <typename dst_t>
 __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid);
+template <typename dst_t>
+__device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid);
 
 // 量化权重整块 → f16（kernel/dq.cu）：rows × k 的原始块解进 out（f16，
 // 行距 k）——投影 GEMM 的权重侧前置（Strata native_proj 的 dequant 步）

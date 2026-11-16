@@ -102,18 +102,8 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, __half* yy, int tid) {
     }
 }
 
-// IQ4_XS：d + scales_h + scales_l[4] + qs[128]（ggml-common.h:454）
-__device__ void dq_iq4_xs(const void* vx, int64_t ibs, __half* yy, int tid) {
-    const IQ4XSBlock* x = (const IQ4XSBlock*) vx + ibs;
-    const int il = tid / 8, ib = tid % 8;
-    __half* y = yy + 32 * ib + 4 * il;
-    const uint8_t* q4 = x->qs + 16 * ib + 4 * il;
-    const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = __float2half_rn(d * kvalues_iq4nl[q4[j] & 0xf]);
-        y[j + 16] = __float2half_rn(d * kvalues_iq4nl[q4[j] >> 4]);
-    }
-}
+// IQ4_XS 的 dq 原语已挪进 dq.cu（共用：嵌入侧要 f32，见 all.cuh 声明）；
+// moe.cu 的 dq_iq4_nl / 交错反量化照旧用 __half 版实例
 
 // 平坦反量化：超块 i → y + 256i（iq_kernels.cu:3329 定型版，type 具体化）
 __global__ void dq_flat_iq4nl_kernel(const uint8_t* __restrict__ vx, __half* __restrict__ y) {

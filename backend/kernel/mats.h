@@ -26,8 +26,8 @@ namespace kern {
 struct Mats {
     volatile int* inputLeft;    // 窗口左沿（staff 词，绝对坐标）
     volatile int* inputRight;   // 窗口右沿
-    const uint8_t* table;       // "token_embd.weight"：Q6_K 词表（与 output.weight
-                                // 同块双名，embedding 侧走这个名字语义对齐）
+    const uint8_t* table;       // "token_embd.weight"：IQ4_XS 词表（嵌入侧专用；
+                                // 输出头是另一张 output.weight Q6_K，本 checkpoint 未 tied）
     const int32_t* tokens;      // staff.deviceSession：ids 槽基址（绝对坐标）
     float* emb;                 // "pf.emb" (T, N) f32
     float* res;                 // "pf.R"   (T, HC, N) f32

@@ -11,6 +11,7 @@
 // __half（GEMM 前置，RNE 舍入——Strata dequant_bf16.cu put(H16*) 同款）。
 // ===========================================================================
 #include "all.cuh"
+#include "iq_tables.cuh"   // kvalues_iq4nl：dq_iq4_xs 的非线性码本
 
 namespace kern {
 
@@ -97,11 +98,30 @@ __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 
+// IQ4_XS（iq_kernels.cu:3052）：每线程管 8 值（y[j]/y[j+16]，j<4），值 =
+// d·kvalues[nibble]；6bit 尺度拆 scales_h(8×2bit)/scales_l(4bit)，块布局见
+// all.cuh IQ4XSBlock。原在 moe.cu（仅 f16），词表改读 token_embd(IQ4_XS)
+// 后嵌入侧要 f32，升为共用原语挪进本文件（同 dq_q6_k 的模板双出参）
+template <typename dst_t>
+__device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const IQ4XSBlock* x = (const IQ4XSBlock*) vx;
+    const int il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 4 * il;
+    const uint8_t* q4 = x[ibs].qs + 16 * ib + 4 * il;
+    const float d = (float) x[ibs].d * ((((x[ibs].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x[ibs].scales_h >> 2 * ib) & 3) << 4)) - 32);
+    for (int j = 0; j < 4; ++j) {
+        y[j + 0] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
+        y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
+    }
+}
+
 // 显式实例化（定义只在本文件，跨 .cu 引用走设备链接 -dlink）
 template __device__ void dq_q6_k<float>(const void*, int64_t, float*, int);
 template __device__ void dq_q6_k<__half>(const void*, int64_t, __half*, int);
 template __device__ void dq_q4_k<float>(const void*, int64_t, float*, int);
 template __device__ void dq_q4_k<__half>(const void*, int64_t, __half*, int);
+template __device__ void dq_iq4_xs<float>(const void*, int64_t, float*, int);
+template __device__ void dq_iq4_xs<__half>(const void*, int64_t, __half*, int);
 
 // ---- host 小入口：量化权重整块 → f16（投影 GEMM 的前置，Strata native_proj
 //      的 dequant 步同位：dequant_f16 后紧接 f16 GEMM，gemm.cu:1456）----

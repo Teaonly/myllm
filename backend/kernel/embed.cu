@@ -5,14 +5,15 @@
 // prefill 的第一个真计算：embedding gather。指针由 scheduler 从剧本
 // qwen3.8-next.vt 的 hash / staff 解出、经 prefill.cpp 组装传入，本文件
 // 不认识剧本也不认识大入口（index.h）：
-//   table   "token_embd.weight"   Q6_K 原始字节（与 output.weight 同块双名，
-//                                 剧本文件头：embedding 侧按 Q6_K 解码）
+//   table   "token_embd.weight"   IQ4_XS 原始字节（本 checkpoint 词表未
+//                                 weight-tied：嵌入表 IQ4_XS，输出头另行
+//                                 读 output.weight Q6_K——对拍实证，勿再合并）
 //   tokens  staff.deviceSession   cache.ids 区在槽首偏移 0，绝对坐标，
 //                                 窗口 [inputLeft, inputRight)
 //   emb/res "pf.emb" / "pf.R"     (T, N) f32 / (T, HC, N) f32（广播进 4 条残差流）
 //   stream  发射落点（scheduler 侧已 wait 过 h2dEvent，ids 已就位）
 // 几何取编译期常量（qwen3.8-next.h §0/§1），与剧本数值同源。
-// dq_q6_k 不在本文件：反量化是全模型共用原语，独立 dq.cu、原型在
+// dq_iq4_xs 不在本文件：反量化是全模型共用原语，独立 dq.cu、原型在
 // all.cuh（跨 .cu 设备调用 → Makefile 走 -rdc=true + dlink）。
 // 落盘验证不在本文件——验证另行单独做。
 //
@@ -24,14 +25,14 @@
 
 namespace kern {
 
-// gather：实现见上（dq_q6_k 解一行超块，出按 (T, n_embd) 连续排）
+// gather：实现见上（dq_iq4_xs 解一行超块，出按 (T, n_embd) 连续排）
 __global__ void embed_rows_kernel(const uint8_t* __restrict__ table, size_t row_bytes,
                                   const int32_t* __restrict__ tokens, int64_t n_embd,
                                   float* __restrict__ y) {
     const int t = blockIdx.y;                    // token 号（窗口内相对序）
     const int64_t b = blockIdx.x;                // 行内第 b 个超块
     const uint8_t* row = table + (size_t) tokens[t] * row_bytes;
-    dq_q6_k(row, b, y + (size_t) t * n_embd + b * 256, threadIdx.x);
+    dq_iq4_xs<float>(row, b, y + (size_t) t * n_embd + b * 256, threadIdx.x);
 }
 
 // 广播：一行 emb（N）复制成 HC 条流的一行（D = HC*N）
@@ -44,7 +45,7 @@ __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restri
 }
 
 void do_embed(volatile int* inputLeft, volatile int* inputRight,  // [left, right) 窗口
-              const uint8_t* table,    // Q6_K 词表（输入输出共享一份）
+              const uint8_t* table,    // IQ4_XS 词表（嵌入侧；输出头是另一张 output.weight）
               const int32_t* tokens,   // ids 槽基址（绝对坐标，窗口偏移自加）
               float* emb,              // 输出 (T, N)
               float* res,              // 输出 (T, HC, N)
@@ -62,7 +63,7 @@ void do_embed(volatile int* inputLeft, volatile int* inputRight,  // [left, righ
 
     // gather：grid=(n/256, T)（n 是 256 整倍，几何保证），32 线程
     embed_rows_kernel<<<dim3((unsigned) (n / 256), (unsigned) T), 32, 0, stream>>>(
-        table, (size_t) (n / 256) * sizeof(Q6KBlock), win, n, emb);
+        table, (size_t) (n / 256) * sizeof(IQ4XSBlock), win, n, emb);
     check_launch("embed gather");
 
     // 广播：emb → HC 条残差流

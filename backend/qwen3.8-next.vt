@@ -8,10 +8,10 @@
 ; 策略随 MoE kernel 接入再定）；剩大块不碰——
 ;     per_layer_token_embd.weight         PLE 巨表 28.8GB（在 00002 分片）
 ;     blk.*.ffn_*_exps.weight             MOE 专家（48 层 × 3，≈46.8 GiB）
-; 词表矩阵（token_embd/output）模型层 weight-tied；pack 里是同源两种量化
-; （output=Q6_K 497MiB，token_embd=IQ4_XS 322MiB），装高精度 Q6_K 一份、
-; 两个名字共用（embedding 侧吃到更高精度的同一矩阵，省 322MiB）。
-; 注意：'token_embd.weight' @ 取到的块按 Q6_K 解码，勿按 GGUF 目录的 IQ4_XS。
+; 词表矩阵两张独立（本 checkpoint 未 weight-tied，2026-11 对拍实证：两表
+; 数值完全不同，非同源的两种量化）：token_embd=IQ4_XS 322MiB 只做嵌入查表，
+; output=Q6_K 497MiB 只做输出头。分装两份，勿再合并（早期版本误当 tied，
+; 嵌入侧吃的是输出头权重，逐层全偏）。
 ;
 ; 装载模式（路径常驻栈底，逐张量复用；三步：探尺寸 → 分配 → 装入）：
 ;     '名字' dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
@@ -20,8 +20,8 @@
 ;   cuda.alloc      ( n -- tensor )         显存块（host.alloc 则落主机锁页）
 ;   gguf.load       ( path name dst -- dst ) 装入（dev 异步 H2D / host 直拷）
 ;   swap !          ( tensor name -- ) 存进 hash；path 留栈
-; 装完 drop 掉路径。合计 1078 个装载 =
-;   3 顶层 output_hc + 1 词表矩阵(双名字一份显存) + 6 PLE 投影(blk.1)
+; 装完 drop 掉路径。合计 1079 个装载 =
+;   3 顶层 output_hc + 2 词表矩阵(嵌入 IQ4_XS + 输出头 Q6_K) + 6 PLE 投影(blk.1)
 ;   + 48 层 × 13 公共 + 36 GDN 层 × 9 + 12 全注意力层 × 10
 ; 另有 48 层 × 3 = 144 个专家块只 probe+alloc 占位（见下），不装载
 ; ============================================================================
@@ -34,9 +34,9 @@
 'output_hc_norm.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 'output_hc_up.weight'    dup2 dup2 gguf.probe cuda.alloc gguf.load swap !
 
-; ---- 词表矩阵（Q6_K 一份显存，双名字；weight-tied，见文件头注释）----
-'output.weight'      dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; 解嵌入 = Q6_K ≈497 MiB
-'output.weight' @ 'token_embd.weight' !    ; embedding 同一块显存的第二个名字（按 Q6_K 解码）
+; ---- 词表矩阵（嵌入/输出头分离，见文件头注释：未 weight-tied）----
+'token_embd.weight'  dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; 嵌入表 = IQ4_XS ≈322 MiB
+'output.weight'      dup2 dup2 gguf.probe cuda.alloc gguf.load swap !   ; 输出头 = Q6_K ≈497 MiB
 
 ; ---- 48 层公共：FFN 共享专家 + 路由 + 超连接（13 个/层）----
 %for 0 47
@@ -527,4 +527,4 @@
 ; ---- 收尾：路径出栈，排空 H2D，报个到 ----
 drop
 cuda.sync
-'qwen3.8-next loaded: 1078 dense weights (output≡token_embd Q6_K; PLE proj in; table on-demand) + memory resident' ?
+'qwen3.8-next loaded: 1079 dense weights (token_embd IQ4_XS embed + output Q6_K head, untied; PLE proj in; table on-demand) + memory resident' ?
